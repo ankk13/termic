@@ -470,8 +470,8 @@ export function RightPanel() {
         }}
       />
       <header className="flex h-10 shrink-0 items-stretch border-b border-[var(--color-border-soft)]">
-        <RTab label="All files" active={view === "files"} onClick={() => setView("files")} />
-        <RTab label="Git" active={view === "changes"} onClick={() => setView("changes")}
+        <RTab label="All files" view="files" active={view === "files"} onClick={() => setView("files")} />
+        <RTab label="Git" view="changes" active={view === "changes"} onClick={() => setView("changes")}
           badge={(gitStatus?.total_changed ?? 0) > 0 ? gitStatus!.total_changed : undefined}
           repoBadge={(gitStatus?.repos_changed ?? 0) > 1 ? gitStatus!.repos_changed : undefined} />
         <div className="flex shrink-0 items-center px-1.5">
@@ -897,9 +897,13 @@ function ScriptStream({ taskId, kind, run, hasScript, dismissKey, onStart, onCon
 // = plain dim text, hover = soft hover. Count appears as plain faint
 // text alongside the label (no accent-colored badge pill) so a "0"
 // reads as informational rather than urgent.
-function RTab({ label, active, badge, repoBadge, onClick }: { label: string; active: boolean; badge?: number; repoBadge?: number; onClick: () => void }) {
+function RTab({ label, view, active, badge, repoBadge, onClick }: { label: string; view: string; active: boolean; badge?: number; repoBadge?: number; onClick: () => void }) {
   return (
     <button
+      // Stable handle for e2e: the visible text is not a reliable selector
+      // here because the badges below join into it (a dirty tree renders
+      // "Git3", not "Git").
+      data-rtab={view}
       onClick={onClick}
       className={cn(
         "flex flex-1 items-center justify-center gap-1.5 border-b-2 text-[13px] font-medium transition-colors",

@@ -1514,6 +1514,12 @@ const captureArmedRef = useRef(false);
             TERMIC_PORT: String(task.port),
             TERMIC_WORKSPACE_NAME: task.name,
             COLORFGBG: currentColorFgBg(),
+            // Only known when this spawn mints or resumes-by-id a
+            // session (see `sessionUuid` above); cwd-resume/shell tabs
+            // have no termic session uuid to hand out. Pairs with
+            // TERMIC_CONTEXT_DIR (Rust, pty_spawn) so an agent can name
+            // its own .context/ artifacts after itself.
+            ...(sessionUuid ? { TERMIC_SESSION_ID: sessionUuid } : {}),
             // Registry entries (agents AND terminal-kind) carry a
             // user-configured env block; sentinel shell/custom tabs don't.
             ...(isAgent || isRegistryTerminal ? envForCli(tab.cli) : {}),

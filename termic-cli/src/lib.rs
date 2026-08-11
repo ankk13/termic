@@ -19,6 +19,7 @@ use termic_proto::exit_code;
 pub mod attach;
 pub mod client;
 pub mod output;
+pub mod plan_capture;
 
 /// The version `termic --version` prints. It is the APP version, injected
 /// at build time via `TERMIC_APP_VERSION` (src-tauri/build.rs and
@@ -721,6 +722,15 @@ surface instead of parsing prose."
         /// Command to describe (default: the top-level overview).
         command: Option<String>,
     },
+
+    /// Internal: Claude Code plan-capture hook body. Reads a hook payload on
+    /// stdin and writes the plan into `$TERMIC_CONTEXT_DIR/plans/`.
+    ///
+    /// HIDDEN on purpose. The app wires this itself (src-tauri/src/plan_hook.rs)
+    /// and `help --json` is the agent-facing surface, so a verb no agent should
+    /// ever call stays out of it. Touches no socket and no app state.
+    #[command(hide = true, name = "capture-plan")]
+    CapturePlan,
 }
 
 #[derive(Subcommand, Debug)]
@@ -804,6 +814,18 @@ fn effective_format(cli: &Cli) -> OutputFormat {
 }
 
 fn execute(cli: &Cli) -> Result<Output, CliError> {
+    // Plan capture runs ABOVE the cage check on purpose. It is not part of
+    // the control-plane surface the cage withholds: no socket, no token, no
+    // app, just a file written inside the worktree the agent can already
+    // write to. And the caged case is precisely the one that needs it, since
+    // a sandboxed claude produces plans like any other. Silent by contract
+    // (a PreToolUse hook's stdout can carry permission decisions), so it
+    // returns empty output and never errors.
+    if let Cmd::CapturePlan = &cli.cmd {
+        plan_capture::run();
+        return Ok(Output::ok(String::new()));
+    }
+
     // In-cage pre-check (docs/plans/cli.md, Security DX): ENFORCING
     // cages get NO CLI surface; fail with the real reason instead of a
     // token error. Monitor is exempt by contract (observe, never
@@ -861,7 +883,7 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
     let token = client::read_token(&paths)?;
 
     match &cli.cmd {
-        Cmd::Help { .. } => unreachable!("handled above"),
+        Cmd::Help { .. } | Cmd::CapturePlan => unreachable!("handled above"),
         Cmd::New { .. } => execute_new(cli, &mut conn, &token, format, &paths, prompt),
         Cmd::Send { .. } => execute_send(cli, &mut conn, &token, format, prompt),
         Cmd::Attach { task, project, shell, tab, resize, detach_keys } => {
@@ -1790,6 +1812,12 @@ pub fn machine_help() -> serde_json::Value {
     let (_, global_flags) = args_of(&root);
     let mut commands = Vec::new();
     for sub in root.get_subcommands() {
+        // `get_subcommands` yields hidden verbs too. Internal ones (e.g.
+        // `capture-plan`) must stay out of the machine-readable surface:
+        // agents read this to learn what they may call.
+        if sub.is_hide_set() {
+            continue;
+        }
         if sub.get_name() == "help" {
             commands.push(command_entry(sub, "help"));
             continue;
@@ -2032,6 +2060,11 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing {expected} in {names:?}");
         }
+        // Hidden internal verbs stay OUT of the agent-facing surface.
+        assert!(
+            !names.contains(&"capture-plan"),
+            "capture-plan is internal and must not be advertised: {names:?}"
+        );
         // Every command documents exit codes; watched verbs carry theirs.
         let by_name = |n: &str| {
             v["commands"].as_array().unwrap().iter().find(|c| c["name"] == n).unwrap().clone()

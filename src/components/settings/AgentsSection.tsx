@@ -558,6 +558,7 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
   // runtime toggle commands, resume / session args, name args, and the
   // work-done switch — none of the agent machinery runs for them.
   const isTerminal = isTerminalEntry(agent);
+  const isDirectClaudeCommand = agent.command.trim().split(/[\\/]/).pop() === "claude";
 
   useEffect(() => {
     if (!autoFocus) return;
@@ -705,6 +706,14 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
           ? "Run through your login shell (quoting, pipes, and rc-file PATH all work). The shell stays interactive after the command exits. Placeholders: {task_slug}, {task_name}, {task_path}, {branch}, {port}."
           : "Single executable to spawn (PATH lookup or absolute path). No shell parsing - quoted/piped strings won't work, and shell-style `VAR=val cmd` prefixes won't either; use the Environment box below for env vars."}>
           <Input value={agent.command} onChange={e => onPatch({ command: e.target.value })} className="font-mono" placeholder={isTerminal ? "docker exec -it -w {task_path} mybox zsh" : "claude"} />
+          {agent.id === "claude" && !isDirectClaudeCommand && (
+            <div className="mt-2 flex items-start gap-2 rounded-md border border-[var(--color-warn)]/35 bg-[var(--color-warn)]/10 px-2.5 py-2 text-[12px] leading-5 text-[var(--color-fg-dim)]">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--color-warn)]" />
+              <span>
+                Plan capture adds Claude settings flags at launch. Use the <span className="font-mono text-[var(--color-fg)]">claude</span> executable directly, or disable “Save agent plans” in General before using a wrapper or launcher.
+              </span>
+            </div>
+          )}
         </Field>
         <Field
           label="Default args"
