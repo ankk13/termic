@@ -105,7 +105,10 @@ and it reverts any active spotlight session, which force-checks-out the
 project's main checkout. `archive` is scoped to one task; this is not.
 
 (`attach` exists too, but it is interactive and needs a real TTY; as an
-agent you want `send`/`logs`/`result` instead.)
+agent you want `send`/`logs`/`result` instead. `watch` also exists: it
+streams every task's state changes until stopped, built for external
+dashboards and ticket automation. Do not run it as an agent; it does not
+end on its own, and `list`/`status` answer the same questions.)
 
 Never edit Termic's own data files; the CLI is the only interface.
 <!-- INSTRUCTIONS END -->

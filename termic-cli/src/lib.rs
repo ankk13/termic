@@ -2,7 +2,7 @@
 //!
 //! Verbs: `list` (alias `ls`), `status`, `open` (Phase 0); `new`,
 //! `wait`, `archive`, `project add|list|remove`, `help --json`
-//! (Phase 1). The app is the daemon; this binary holds no state, reads
+//! (Phase 1); `watch` (v7: stream task state transitions). The app is the daemon; this binary holds no state, reads
 //! none of termic's data files, and links only `termic-proto`
 //! (docs/plans/cli.md). Exit codes and `--output-format` shapes are a
 //! public contract: see `termic_proto::exit_code` and the per-command
@@ -299,6 +299,33 @@ running, 5 CLI disabled, 6 refused, 7 --timeout expired, 8 connection lost."
         /// Wait on one tab: a tab id, 1-based index, or title.
         #[arg(long, value_name = "SEL")]
         tab: Option<String>,
+    },
+
+    /// Stream task state changes as they happen (dashboards, automation).
+    #[command(
+        after_help = "Streams one event per task work-state transition across every task (or one \
+project's tasks under --project), starting with a snapshot of each task's \
+current state. States: working, waiting, done, idle, inactive (no agent tab \
+open); a task archived mid-watch emits one final \"archived\" event. Runs \
+until Ctrl-C, --timeout, or the app goes away.
+
+Built for external automation (ticket bridges, dashboards, notifiers): pair \
+with --output-format stream-json and consume NDJSON task_state events; \
+heartbeats ride along as the liveness signal during quiet stretches. Text \
+mode prints one \"project/task state\" line per event. This is the push \
+alternative to polling `termic list` in a loop.
+
+Exit codes: 0 the stream ended (--timeout reached, or the server closed it \
+cleanly), 1 error (unknown project, or the app's UI stopped reporting \
+state), 4 app not running, 5 CLI disabled, 6 refused, 8 connection lost."
+    )]
+    Watch {
+        /// Only this project's tasks.
+        #[arg(long)]
+        project: Option<String>,
+        /// End the stream (exit 0) after this long. E.g. 90, 30s, 5m, 1h.
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
     },
 
     /// Prompt the task's running agent; queues if it is mid-turn.
@@ -988,6 +1015,19 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
             let code = w.result.outcome.exit_code();
             Ok(Output { stdout: final_stdout(format, &output::wait_text(&w), &w), code })
         }
+        Cmd::Watch { project, timeout } => {
+            let timeout_ms = timeout.as_deref().map(parse_duration_ms).transpose()?;
+            let cmd = proto::Command::Watch { project: project.clone(), timeout_ms };
+            if format == OutputFormat::Text {
+                eprintln!("termic: watching task states (Ctrl-C stops; tasks keep running)");
+            }
+            let data = run_streamed(&mut conn, cmd, &token, format)?;
+            let proto::ReplyData::Watch(w) = data else {
+                return Err(CliError::new(exit_code::ERROR, "unexpected reply to watch"));
+            };
+            let text = format!("watch ended ({}) after {} events", w.reason, w.events);
+            Ok(Output::ok(final_stdout(format, &text, &w)))
+        }
         Cmd::Agents => {
             let data = client::request(&mut conn, proto::Command::Agents, &token)?;
             let proto::ReplyData::Agents(a) = data else {
@@ -1601,6 +1641,12 @@ fn print_event(format: OutputFormat, ev: &proto::StreamEvent) {
             "prompt_delivered" => eprintln!("termic: prompt delivered"),
             "queued" => {
                 eprintln!("termic: prompt queued; it sends when the agent's current turn finishes");
+            }
+            "task_state" => {
+                // `watch`: one "project/task state" line per transition.
+                if let (Some(task), Some(state)) = (&ev.task, &ev.state) {
+                    println!("{}/{} {}", task.project, task.name, state);
+                }
             }
             _ => {}
         },
