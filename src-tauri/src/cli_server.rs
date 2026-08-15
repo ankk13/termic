@@ -3069,6 +3069,11 @@ pub struct TabAgentState {
     /// custom terminal, work-done-incapable agents).
     #[serde(default)]
     pub state: Option<String>,
+    /// Verbatim attention text (OSC 9/777 body) when `state` is
+    /// "waiting"; None otherwise. Mirrors TerminalTab.unread.message
+    /// (src/lib/cliAgentState.ts computeTabState).
+    #[serde(default)]
+    pub message: Option<String>,
     /// Prompts queued behind this tab's current turn.
     #[serde(default)]
     pub queued: u32,
@@ -3206,6 +3211,7 @@ pub(crate) fn cached_tab_states(
                 agent: t.cli.clone(),
                 title: t.title.clone(),
                 state: t.state.clone(),
+                message: t.message.clone(),
                 is_default: t.is_default,
                 live: t.live,
                 queued: t.queued,
@@ -5793,6 +5799,7 @@ mod tests {
         cli: &str,
         title: &str,
         state: Option<&str>,
+        message: Option<&str>,
         live: bool,
         is_default: bool,
     ) -> TabAgentState {
@@ -5802,6 +5809,7 @@ mod tests {
             cli: cli.into(),
             title: title.into(),
             state: state.map(str::to_string),
+            message: message.map(str::to_string),
             queued: 0,
             capable: state.is_some(),
             live,
@@ -5829,9 +5837,9 @@ mod tests {
             "w3",
             "idle",
             vec![
-                tab_state("tab-a", "agent", "claude", "claude", Some("idle"), true, true),
-                tab_state("tab-b", "agent", "codex", "fixing tests", Some("idle"), true, false),
-                tab_state("tab-c", "shell", "shell", "Terminal", None, true, false),
+                tab_state("tab-a", "agent", "claude", "claude", Some("idle"), None, true, true),
+                tab_state("tab-b", "agent", "codex", "fixing tests", Some("idle"), None, true, false),
+                tab_state("tab-c", "shell", "shell", "Terminal", None, None, true, false),
             ],
         );
     }
@@ -5867,8 +5875,8 @@ mod tests {
             "w3",
             "idle",
             vec![
-                tab_state("tab-a", "agent", "claude", "claude", Some("idle"), true, true),
-                tab_state("tab-b", "agent", "claude", "claude", Some("idle"), true, false),
+                tab_state("tab-a", "agent", "claude", "claude", Some("idle"), None, true, true),
+                tab_state("tab-b", "agent", "claude", "claude", Some("idle"), None, true, false),
             ],
         );
         let e = resolve_tab_selector(&host, &w3(&host), "claude").unwrap_err();
@@ -6025,7 +6033,7 @@ mod tests {
             Ok(serde_json::json!({ "mode": "delivered", "capable": true })),
         );
         let stale = |state: &str| {
-            vec![tab_state("tab-b", "agent", "codex", "codex", Some(state), true, false)]
+            vec![tab_state("tab-b", "agent", "codex", "codex", Some(state), None, true, false)]
         };
         push_tabs(&host, "w3", "done", stale("done"));
         let mut cmd = send_cmd("solo", true);
@@ -6068,8 +6076,8 @@ mod tests {
             "w3",
             "working",
             vec![
-                tab_state("tab-a", "agent", "claude", "claude", Some("working"), true, true),
-                tab_state("tab-b", "agent", "codex", "codex", Some("done"), true, false),
+                tab_state("tab-a", "agent", "claude", "claude", Some("working"), None, true, true),
+                tab_state("tab-b", "agent", "codex", "codex", Some("done"), None, true, false),
             ],
         );
         let mut cmd = wait_cmd("solo", Some(2_000));
@@ -6090,10 +6098,10 @@ mod tests {
             "w3",
             "idle",
             vec![
-                tab_state("tab-dead", "agent", "claude", "claude", Some("idle"), false, false),
+                tab_state("tab-dead", "agent", "claude", "claude", Some("idle"), None, false, false),
                 {
                     let mut t =
-                        tab_state("tab-nod", "agent", "nodone", "nodone", None, true, false);
+                        tab_state("tab-nod", "agent", "nodone", "nodone", None, None, true, false);
                     t.capable = false;
                     t
                 },
@@ -6120,7 +6128,7 @@ mod tests {
             &host,
             "w3",
             "working",
-            vec![tab_state("tab-a", "agent", "claude", "claude", Some("working"), true, true)],
+            vec![tab_state("tab-a", "agent", "claude", "claude", Some("working"), None, true, true)],
         );
         let mut cmd = wait_cmd("solo", Some(5_000));
         if let Command::Wait { tab, .. } = &mut cmd {
@@ -6240,6 +6248,36 @@ mod tests {
         assert_eq!(tabs[1].title, "fixing tests");
         assert_eq!(tabs[2].kind, "shell");
         assert!(tabs[0].is_default);
+        // seed_strip's tabs are all idle/no-settle-signal; message is
+        // None on every row here (not just absent from a waiting one).
+        assert!(tabs.iter().all(|t| t.message.is_none()));
+
+        // A waiting tab's attention text (OSC 9/777 body) rides through
+        // to `status --json` (own host/push - seed_strip is shared by
+        // other tests and must stay idle-only).
+        let waiting_host = StubHost::default();
+        push_tabs(
+            &waiting_host,
+            "w3",
+            "waiting",
+            vec![tab_state(
+                "tab-w", "agent", "claude", "claude", Some("waiting"),
+                Some("Claude needs your permission to edit auth.py"), true, true,
+            )],
+        );
+        let reply = handle(
+            &req(
+                Command::Status { task: Some("solo".into()), project: None, cwd: None },
+                Some("tok"),
+            ),
+            &waiting_host,
+        );
+        let Some(ReplyData::Status(s)) = reply.data else { panic!("expected status") };
+        let tabs = s.task.tabs.expect("tabs listed");
+        assert_eq!(
+            tabs[0].message.as_deref(),
+            Some("Claude needs your permission to edit auth.py")
+        );
 
         // No push: UNKNOWN, not an empty strip.
         let silent = StubHost::default();
