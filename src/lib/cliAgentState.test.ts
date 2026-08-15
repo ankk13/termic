@@ -74,7 +74,7 @@ describe("computeAgentStates aggregation", () => {
   it("reports 'inactive' with 0 tabs when a task has no live terminal tabs", () => {
     const s = statesFor({ dormant: [] });
     expect(s.dormant).toEqual({
-      state: "inactive", tabs: 0, queued: 0, capable: false, tab_states: [],
+      state: "inactive", tabs: 0, queued: 0, capable: false, message: null, tab_states: [],
     });
   });
 
@@ -176,6 +176,84 @@ describe("per-tab snapshot (tab_states, GH #138 part 2)", () => {
     expect(s.t.tab_states.map(t => t.capable)).toEqual(
       [true, true, true, true, false, false],
     );
+  });
+
+  it("carries the agent's own reason for blocking, verbatim", () => {
+    const s = statesFor({
+      t: [term({
+        cli: "claude",
+        unread: { reason: "attention", message: "Claude needs your permission to run rm" },
+      })],
+    });
+    expect(s.t.tab_states[0].message).toBe("Claude needs your permission to run rm");
+  });
+
+  it("falls back to the live tab title when the agent announced no body", () => {
+    // unread.message is only ever set on the OSC 9 / OSC 777 path, so
+    // codex (which signals attention through its title) would otherwise
+    // report a blocked tab with no reason at all.
+    const s = statesFor({
+      t: [
+        term({ cli: "codex", unread: { reason: "attention" }, liveTitle: "Action Required" }),
+        // A body beats a title when both exist.
+        term({
+          cli: "codex",
+          unread: { reason: "attention", message: "approve the patch?" },
+          liveTitle: "Action Required",
+        }),
+        // Neither: silent is silent, never an invented reason.
+        term({ cli: "codex", unread: { reason: "attention" } }),
+      ],
+    });
+    expect(s.t.tab_states.map(t => t.message)).toEqual([
+      "Action Required", "approve the patch?", null,
+    ]);
+  });
+
+  it("reports a reason only while the tab is waiting", () => {
+    // A body left over from the last block, or a spinner-frame
+    // liveTitle, must not be presented as a live reason.
+    const stale = { reason: "done", message: "needs your permission" } as const;
+    const s = statesFor({
+      t: [
+        term({ cli: "claude", workState: "working", unread: stale, liveTitle: "* thinking" }),
+        term({ cli: "claude", workState: "done", unread: stale }),
+        term({ cli: "claude", liveTitle: "* Ready" }),
+        // No settle signal at all: state is null, so is the reason.
+        term({ cli: "shell", unread: { reason: "attention", message: "x" } }),
+      ],
+    });
+    expect(s.t.tab_states.map(t => t.state)).toEqual(["working", "done", "idle", null]);
+    expect(s.t.tab_states.map(t => t.message)).toEqual([null, null, null, null]);
+  });
+
+  it("truncates a runaway reason before it reaches the push payload", () => {
+    const s = statesFor({
+      t: [term({ cli: "claude", unread: { reason: "attention", message: "z".repeat(500) } })],
+    });
+    expect(s.t.tab_states[0].message).toHaveLength(200);
+  });
+
+  it("gives the task the first waiting tab's reason, and none otherwise", () => {
+    const s = statesFor({
+      blocked: [
+        term({ cli: "claude", workState: "done" }),
+        term({ cli: "claude", unread: { reason: "attention", message: "first" } }),
+        term({ cli: "claude", unread: { reason: "attention", message: "second" } }),
+      ],
+      quiet: [term({ cli: "claude", unread: { reason: "attention" } })],
+      busy: [
+        term({ cli: "claude", workState: "working" }),
+        // Working outranks attention for the task, so the task-level
+        // reason must not leak out of a tab the aggregate is ignoring.
+        term({ cli: "claude", unread: { reason: "attention", message: "ignored" } }),
+      ],
+    });
+    expect(s.blocked.message).toBe("first");
+    expect(s.quiet.state).toBe("waiting");
+    expect(s.quiet.message).toBeNull();
+    expect(s.busy.state).toBe("working");
+    expect(s.busy.message).toBeNull();
   });
 
   it("carries id, per-tab queue, liveness and defaultness for resolution", () => {

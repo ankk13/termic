@@ -125,10 +125,14 @@ pub enum Cmd {
     #[command(
         visible_alias = "ls",
         after_help = "Prints one row per task on stdout; with -q, task ids only. \
+A WAITING FOR column appears when at least one task is blocked and its agent \
+said why. \
 With --output-format json, one object: {\"tasks\": [...]} where each task carries \
 id, name, project, agent, branch, base_branch, path, work_state (\"working\", \
 \"waiting\", \"done\", \"idle\", \"inactive\"; omitted when the UI could not answer), \
-open_tabs and diff {files_changed, insertions, deletions, untracked}.
+open_tabs, message (why the agent is blocked, agent-authored; only while \
+waiting, and omitted when it said nothing) and diff {files_changed, insertions, \
+deletions, untracked}.
 
 Exit codes: 0 success, 1 unknown project, 4 app not running, 5 CLI disabled, \
 6 refused, 8 connection lost."
@@ -145,8 +149,10 @@ Exit codes: 0 success, 1 unknown project, 4 app not running, 5 CLI disabled, \
     /// Show one task in depth: agent state, branch, dirty file count, sessions.
     #[command(
         after_help = "Prints `key: value` lines on stdout. With --output-format json, one \
-object: {\"task\": {...}} with the list fields plus sandbox, sessions and \
-dirty_files. Without <TASK>, resolves the task from the current directory \
+object: {\"task\": {...}} with the list fields plus sandbox, sessions, \
+dirty_files and tabs[], each tab carrying id, index, kind, agent, title, state, \
+message (why that tab is blocked; only while waiting), is_default, live and \
+queued. Without <TASK>, resolves the task from the current directory \
 (worktrees first, then main-checkout tasks), like `open`. Use --project \
 (or project/name) when the name exists in more than one project.
 

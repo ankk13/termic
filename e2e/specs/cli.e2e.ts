@@ -177,6 +177,58 @@ describe("termic tab: ids are addressable end to end (GH #138 part 2)", () => {
     expect(tabs.every((t: any) => t.kind === "agent")).toBe(true);
   });
 
+  it("carries an agent's waiting reason out to status and list", async () => {
+    // The chain no unit suite spans: the store's unread.message, the
+    // debounced cli_agent_states push, the Rust cache, the wire. Drop
+    // the field at any hop and BOTH reads below go silent, which is
+    // exactly the regression this guards (the reason for the feature is
+    // that `list` answers WHY without a `status` per task).
+    const reason = `FAKE-AGENT needs your permission ${Date.now()}`;
+    const blockedId = await browser.execute(
+      (tid, msg) => {
+        const app = window.__termic!.useApp.getState();
+        const tabs = app.tabs[tid] ?? [];
+        const tab = tabs.find((t: any) => t.type === "terminal" && t.is_default) ?? tabs[0];
+        app.markAttention(tid, tab.id, "attention", msg);
+        return tab.id;
+      },
+      taskId,
+      reason,
+    );
+
+    // The push is debounced and the cache is polled, so wait on the
+    // condition rather than assuming one round trip is enough.
+    await browser.waitUntil(
+      async () => {
+        const r = await rpc({ cmd: "status", task: "cli-tabs" });
+        return r.ok && (r.data.task.tabs ?? []).some((t: any) => t.message === reason);
+      },
+      { timeout: 15_000, timeoutMsg: "the waiting reason never reached status --json" },
+    );
+
+    const s = await rpc({ cmd: "status", task: "cli-tabs" });
+    const blocked = s.data.task.tabs.find((t: any) => t.id === blockedId);
+    expect(blocked.state).toBe("waiting");
+    expect(blocked.message).toBe(reason);
+    // Tabs that are not blocked stay silent: no reason invented, none
+    // inherited from the tab next door.
+    expect(s.data.task.tabs.filter((t: any) => t.message).length).toBe(1);
+
+    // And the task-level reason `list` renders comes off that same tab.
+    const l = await rpc({ cmd: "list" });
+    const task = l.data.tasks.find((t: any) => t.id === taskId);
+    expect(task.work_state).toBe("waiting");
+    expect(task.message).toBe(reason);
+
+    // Unblock the tab again: the cases after this one share the window,
+    // and a task stuck in "waiting" is state they should not inherit.
+    await browser.execute(
+      (tid, tab) => window.__termic!.useApp.getState().clearAttention(tid, tab),
+      taskId,
+      blockedId,
+    );
+  });
+
   it("tab -p opens a tab and confirms delivery into exactly that tab", async () => {
     const marker = `MARKER-P-${Date.now()}`;
     const r = await rpc({

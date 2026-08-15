@@ -61,6 +61,47 @@ pub fn state_cell(state: &Option<String>) -> String {
     state.clone().unwrap_or_else(|| "-".into())
 }
 
+/// Widest a waiting-reason gets before it is cut. Wide enough for the
+/// permission lines agents actually emit, narrow enough that the cell
+/// still reads as a cell.
+const REASON_MAX: usize = 60;
+
+/// A waiting reason, made safe to print. The text is agent-authored and
+/// arrives off a PTY, so this is parse-at-the-boundary: control
+/// characters are dropped (a stray ESC would repaint the CALLER's
+/// terminal, which is a real hazard, not a cosmetic one), every
+/// whitespace run collapses to a single space so a multi-line body
+/// cannot break the table, and the result is truncated by CHARACTER
+/// count, matching how the column widths are measured. `None` for
+/// anything that is empty once cleaned, so a blank reason never
+/// conjures a column.
+fn reason_cell(message: &Option<String>) -> Option<String> {
+    let raw = message.as_deref()?;
+    let mut out = String::new();
+    let mut gap = false;
+    for c in raw.chars() {
+        // Whitespace first: newline and tab are both whitespace AND
+        // control, and they should read as a separator, not vanish.
+        if c.is_whitespace() {
+            gap = !out.is_empty();
+        } else if !c.is_control() {
+            if gap {
+                out.push(' ');
+                gap = false;
+            }
+            out.push(c);
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if out.chars().count() > REASON_MAX {
+        let head: String = out.chars().take(REASON_MAX - 3).collect();
+        return Some(format!("{head}..."));
+    }
+    Some(out)
+}
+
 pub fn list_text(tasks: &[TaskSummary]) -> String {
     if tasks.is_empty() {
         return "no tasks".into();
@@ -68,18 +109,36 @@ pub fn list_text(tasks: &[TaskSummary]) -> String {
     // Project then task, matching how tasks are addressed everywhere else
     // (`status project/task`, the `project/name` ambiguity errors). Rows
     // arrive already sorted by (project, name), so this reads top-down.
-    let header = ["PROJECT", "TASK", "AGENT", "STATE", "DIFF", "BRANCH"];
-    let rows: Vec<[String; 6]> = tasks
+    let reasons: Vec<Option<String>> = tasks.iter().map(|t| reason_cell(&t.message)).collect();
+    // The reason column exists only when something is actually blocked.
+    // Two reasons to make it conditional rather than always-on: the
+    // everyday `list` output (and anything parsing it) stays exactly
+    // what it was before this feature, and a column of dashes would
+    // otherwise be the normal case. It goes LAST because it is the one
+    // free-text cell, and the last column is the unpadded one, so no
+    // length of reason can skew the table.
+    let show_reason = reasons.iter().any(Option::is_some);
+    let mut header: Vec<String> =
+        ["PROJECT", "TASK", "AGENT", "STATE", "DIFF", "BRANCH"].map(String::from).into();
+    if show_reason {
+        header.push("WAITING FOR".into());
+    }
+    let rows: Vec<Vec<String>> = tasks
         .iter()
-        .map(|t| {
-            [
+        .zip(&reasons)
+        .map(|(t, reason)| {
+            let mut row = vec![
                 t.project.clone(),
                 t.name.clone(),
                 t.agent.clone(),
                 state_cell(&t.work_state),
                 diff_cell(&t.diff),
                 t.branch.clone(),
-            ]
+            ];
+            if show_reason {
+                row.push(reason.clone().unwrap_or_else(|| "-".into()));
+            }
+            row
         })
         .collect();
     // Width by CHARACTER count, not bytes: Rust's `{:width$}` pads strings
@@ -109,14 +168,14 @@ pub fn list_text(tasks: &[TaskSummary]) -> String {
             .trim_end()
             .to_string()
     };
-    let mut out = vec![fmt_row(&header.map(String::from))];
+    let mut out = vec![fmt_row(&header)];
     out.extend(rows.iter().map(|r| fmt_row(r)));
     out.join("\n")
 }
 
 /// One `status` tab row: `[n] title (facts)`, where the facts are the
-/// kind or agent, the per-tab state when one exists, the queue depth,
-/// and default-ness.
+/// kind or agent, the per-tab state when one exists, why it is blocked,
+/// the queue depth, and default-ness.
 fn tab_row(t: &TabStatus) -> String {
     let mut bits: Vec<String> = Vec::new();
     bits.push(if t.kind == "agent" { t.agent.clone() } else { t.kind.clone() });
@@ -125,8 +184,17 @@ fn tab_row(t: &TabStatus) -> String {
     // on a tab with no PTY would invite a send that errors.
     if t.kind == "agent" && !t.live {
         bits.push("not running".into());
-    } else if let Some(st) = &t.state {
-        bits.push(st.clone());
+    } else {
+        if let Some(st) = &t.state {
+            bits.push(st.clone());
+        }
+        // Why it is blocked, immediately after the state it explains.
+        // Skipped on the dead-tab branch above for the same reason the
+        // state is: whatever the agent last said is stale once its PTY
+        // is gone.
+        if let Some(reason) = reason_cell(&t.message) {
+            bits.push(reason);
+        }
     }
     if t.queued > 0 {
         bits.push(format!("{} queued", t.queued));
@@ -644,9 +712,18 @@ mod tests {
             agent: agent.into(),
             title: title.into(),
             state: state.map(str::to_string),
+            message: None,
             is_default,
             live,
             queued,
+        }
+    }
+
+    /// The same row, blocked, with the agent's own reason attached.
+    fn waiting_tab(index: u32, agent: &str, reason: &str) -> TabStatus {
+        TabStatus {
+            message: Some(reason.into()),
+            ..tab_status(index, "agent", agent, agent, Some("waiting"), false, true, 0)
         }
     }
 
@@ -663,7 +740,18 @@ mod tests {
             created: "2026-01-01T00:00:00Z".into(),
             work_state: Some("working".into()),
             open_tabs: Some(2),
+            message: None,
             diff: Some(DiffStat { files_changed: 3, insertions: 10, deletions: 2, untracked: 1 }),
+        }
+    }
+
+    /// A blocked task carrying the agent's own reason.
+    fn waiting(name: &str, reason: &str) -> TaskSummary {
+        TaskSummary {
+            name: name.into(),
+            work_state: Some("waiting".into()),
+            message: Some(reason.into()),
+            ..summary()
         }
     }
 
@@ -686,6 +774,70 @@ api      longer-task-name  codex   -        -             b2";
     #[test]
     fn list_text_empty() {
         assert_eq!(list_text(&[]), "no tasks");
+    }
+
+    // The whole point of the ticket: an operator reads WHY off `list`
+    // instead of running `status` per task. The column is the LAST one
+    // (free text cannot skew a table from there) and every other column
+    // keeps its meaning.
+    #[test]
+    fn list_text_shows_the_waiting_reason_in_a_trailing_column() {
+        let out = list_text(&[
+            summary(),
+            waiting("needs-review", "Claude needs your permission to run rm -rf build"),
+        ]);
+        let expected = "\
+PROJECT  TASK          AGENT   STATE    DIFF          BRANCH    WAITING FOR
+web      fix-auth      claude  working  3f +10 -2 1u  fix-auth  -
+web      needs-review  claude  waiting  3f +10 -2 1u  fix-auth  Claude needs your permission to run rm -rf build";
+        assert_eq!(out, expected);
+    }
+
+    // Conditional on purpose: with nothing blocked the column would be
+    // a stripe of dashes, and every script parsing `list` today would
+    // see a new field appear for no reason. `list_text_golden` above is
+    // the other half of this pair, asserting the unchanged shape.
+    #[test]
+    fn list_text_omits_the_reason_column_when_nothing_says_why() {
+        // Waiting, but the agent went quiet: still no column.
+        let mute = TaskSummary { work_state: Some("waiting".into()), ..summary() };
+        let out = list_text(&[mute]);
+        assert!(!out.contains("WAITING FOR"), "{out}");
+        assert!(out.lines().next().unwrap().ends_with("BRANCH"), "{out}");
+    }
+
+    // The reason is agent-authored text off a PTY, so it is sanitized at
+    // the boundary: a raw ESC would repaint the CALLER's terminal, and a
+    // newline would break the table into pieces.
+    #[test]
+    fn reason_cell_strips_control_characters_and_flattens_whitespace() {
+        let dirty = Some("  needs\n\tyour \u{1b}[31mpermission\u{7}  ".to_string());
+        assert_eq!(reason_cell(&dirty).unwrap(), "needs your [31mpermission");
+        // Nothing but noise is not a reason, so it must not conjure a column.
+        assert!(reason_cell(&Some("\u{1b}\u{7}\n  ".into())).is_none());
+        assert!(reason_cell(&None).is_none());
+    }
+
+    #[test]
+    fn reason_cell_truncates_by_character_not_byte() {
+        // 70 "é" (2 bytes each): a byte-based cut would slice mid-char
+        // or land short. REASON_MAX chars out, the last three an ellipsis.
+        let long = "é".repeat(70);
+        let cut = reason_cell(&Some(long)).unwrap();
+        assert_eq!(cut.chars().count(), REASON_MAX);
+        assert!(cut.ends_with("..."), "{cut}");
+        assert_eq!(cut.chars().filter(|c| *c == 'é').count(), REASON_MAX - 3);
+        // Exactly at the cap is left whole: no ellipsis for nothing.
+        let exact = "x".repeat(REASON_MAX);
+        assert_eq!(reason_cell(&Some(exact.clone())).unwrap(), exact);
+    }
+
+    #[test]
+    fn list_text_truncates_a_long_reason_rather_than_wrapping() {
+        let out = list_text(&[waiting("blocked", &"y".repeat(120))]);
+        let row = out.lines().nth(1).unwrap();
+        assert!(row.ends_with("..."), "{row}");
+        assert_eq!(out.lines().count(), 2, "a reason must never become extra rows: {out}");
     }
 
     #[test]
@@ -755,6 +907,35 @@ tabs:        [1] claude (claude, working, default)
              [3] Terminal (shell)
              [4] claude (claude, not running)";
         assert!(out.contains(expected), "{out}");
+    }
+
+    // `status --json` carries tabs[].message, so the text rendering has
+    // to say it too: one delivery must never be described two ways.
+    #[test]
+    fn status_text_tab_rows_name_why_the_tab_is_blocked() {
+        let t = TaskStatus {
+            summary: summary(),
+            sandbox: "enforce".into(),
+            sessions: 1,
+            dirty_files: Some(0),
+            tabs: Some(vec![
+                waiting_tab(1, "claude", "needs your permission to run rm -rf build"),
+                // Waiting with nothing said: the row is exactly what it
+                // was before this feature, no empty parenthetical.
+                tab_status(2, "agent", "codex", "codex", Some("waiting"), false, true, 0),
+                // Dead tab: liveness outranks state, and it outranks the
+                // reason too. Whatever it last said is stale.
+                TabStatus {
+                    message: Some("needs your permission".into()),
+                    ..tab_status(3, "agent", "claude", "claude", Some("waiting"), false, false, 0)
+                },
+            ]),
+        };
+        let expected = "\
+tabs:        [1] claude (claude, waiting, needs your permission to run rm -rf build)
+             [2] codex (codex, waiting)
+             [3] claude (claude, not running)";
+        assert!(status_text(&t).contains(expected), "{}", status_text(&t));
     }
 
     #[test]
@@ -1005,11 +1186,15 @@ commits:
                 tab_status(1, "agent", "claude", "claude", Some("working"), true, true, 2),
                 tab_status(2, "shell", "shell", "Terminal", None, false, true, 0),
                 tab_status(3, "agent", "codex", "codex", None, false, false, 0),
+                waiting_tab(4, "claude", "needs your permission"),
             ]),
         };
         let wait = WaitResult { outcome: WaitOutcome::Timeout, state: None, detail: None };
         for s in [
             list_text(&[summary()]),
+            // The reason column's own copy (the header and the "-" for
+            // rows with nothing to say) is ours, so it is in scope here.
+            list_text(&[summary(), waiting("blocked", "needs your permission")]),
             status_text(&t),
             open_text(&OpenData { task: None, raised: true }),
             new_created_text(&summary()),

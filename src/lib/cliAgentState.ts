@@ -29,6 +29,11 @@ export interface TaskAgentState {
   /** Any tab has work-done detection; without it `wait` is refused
    *  (no settle signal exists). */
   capable: boolean;
+  /** Why the agent is blocked, taken from the first waiting tab, so
+   *  `termic list` can say WHY without a `status` per task. `null`
+   *  whenever the task is not waiting, or the agent went quiet without
+   *  saying anything. */
+  message: string | null;
   /** The STRIP's terminal tabs in display order (GH #138 part 2): what
    *  `--tab` selectors resolve against and `status` lists. Pane-split
    *  leaves are excluded (they are inside a strip tab, not on the
@@ -50,6 +55,8 @@ export interface TabAgentState {
   /** Per-tab work state; null when the tab has no settle signal (shell,
    *  custom terminal, work-done-incapable agent). */
   state: string | null;
+  /** Why this tab is blocked; null unless `state` is "waiting". */
+  message: string | null;
   /** Prompts queued behind this tab's current turn. */
   queued: number;
   /** Work-done detection exists for this tab's cli. */
@@ -58,6 +65,23 @@ export interface TabAgentState {
   live: boolean;
   /** The tab send/wait/attach/logs target when `--tab` is absent. */
   is_default: boolean;
+}
+
+/** Longest reason we push. The whole snapshot is JSON-stringified and
+ *  diffed on every store change (see the debounce below), so an agent
+ *  emitting a paragraph-long notification body would otherwise pay for
+ *  it on every cycle. The CLI truncates again, harder, for display. */
+const MAX_REASON = 200;
+
+/** Why a blocked tab is blocked, in the order the two signals deserve:
+ *  the agent's own notification body first (verbatim, e.g. "Claude needs
+ *  your permission to run rm"), then its live tab title. The fallback
+ *  earns its place: `unread.message` is only ever set on the OSC 9 /
+ *  OSC 777 path, so codex (which signals attention through its title)
+ *  and the output-line matcher would otherwise have no reason at all. */
+function waitingReason(t: TerminalTab): string | null {
+  const text = t.unread?.message?.trim() || t.liveTitle?.trim();
+  return text ? text.slice(0, MAX_REASON) : null;
 }
 
 /** The wire shape for one strip tab. Exported for tests. */
@@ -78,6 +102,10 @@ export function computeTabState(t: TerminalTab, agents: AppState["agents"]): Tab
     cli: t.cli,
     title: t.title || t.cli,
     state,
+    // Gated on "waiting" deliberately: a notification body left over
+    // from the last block would be a lie once the agent is back at
+    // work, and liveTitle is a spinner frame most of the time.
+    message: state === "waiting" ? waitingReason(t) : null,
     queued: t.queue?.length ?? 0,
     capable,
     live: !!t.ptyId,
@@ -100,7 +128,9 @@ export function computeAgentStates(s: AppState = useApp.getState()): Record<stri
       (t): t is TerminalTab => t.type === "terminal",
     );
     if (term.length === 0) {
-      states[task.id] = { state: "inactive", tabs: 0, queued: 0, capable: false, tab_states: [] };
+      states[task.id] = {
+        state: "inactive", tabs: 0, queued: 0, capable: false, message: null, tab_states: [],
+      };
       continue;
     }
     let state = "idle";
@@ -110,7 +140,15 @@ export function computeAgentStates(s: AppState = useApp.getState()): Record<stri
     const queued = term.reduce((n, t) => n + (t.queue?.length ?? 0), 0);
     const capable = term.some(t => workDoneCapable(t.cli, s.agents));
     const tab_states = term.filter(t => !t.paneId).map(t => computeTabState(t, s.agents));
-    states[task.id] = { state, tabs: term.length, queued, capable, tab_states };
+    // The task's reason is the first waiting STRIP tab's, so `list` and
+    // `status` quote the same tab. Sourced from tab_states, which is
+    // narrower than `term` (no pane-split leaves, and incapable tabs
+    // carry a null state), so a task can be waiting on a tab that has
+    // no row here. That lands as `null`: no reason beats a wrong one.
+    const message = state === "waiting"
+      ? tab_states.find(t => t.state === "waiting")?.message ?? null
+      : null;
+    states[task.id] = { state, tabs: term.length, queued, capable, message, tab_states };
   }
   return states;
 }

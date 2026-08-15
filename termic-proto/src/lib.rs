@@ -728,6 +728,15 @@ pub struct TaskSummary {
     /// Live terminal tabs open for this task, when the webview answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_tabs: Option<u32>,
+    /// Why the agent is blocked, from the first waiting tab: the agent's
+    /// own notification body ("Claude needs your permission to run rm"),
+    /// or its live tab title when it announced no body. Present only
+    /// while `work_state` is "waiting", and only when the agent said
+    /// something: a waiting task with a silent agent has `None`. This is
+    /// agent-authored text, not our copy, so consumers must sanitize it
+    /// before printing to a terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     /// Diff stat vs the base branch. `None` when git had nothing to say
     /// (non-git project, git error).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -788,6 +797,12 @@ pub struct TabStatus {
     /// through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// Why this tab is blocked: the agent's own notification body, or
+    /// its live title when it announced no body. Present only while
+    /// `state` is "waiting", and only when the agent said something.
+    /// Agent-authored text (sanitize before printing to a terminal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     /// The tab send/wait/attach/logs resolve to when `--tab` is absent.
     pub is_default: bool,
     /// A PTY is live in this tab right now (vs a durable tab awaiting

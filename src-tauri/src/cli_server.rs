@@ -571,6 +571,8 @@ pub(crate) trait CliHost: Send + Sync {
 pub(crate) struct WorkStateInfo {
     pub state: String,
     pub tabs: u32,
+    /// Why the agent is blocked, when it is and when it said so.
+    pub message: Option<String>,
 }
 
 /// The gate every authenticated verb passes: the "Enable CLI" setting,
@@ -2417,6 +2419,7 @@ fn summarize(
         created: task.created.clone(),
         work_state: info.map(|i| i.state.clone()),
         open_tabs: info.map(|i| i.tabs),
+        message: info.and_then(|i| i.message.clone()),
         diff,
     }
 }
@@ -2891,6 +2894,12 @@ pub struct TaskAgentState {
     /// out). Without it there is no settle signal to wait on.
     #[serde(default)]
     pub capable: bool,
+    /// Why the agent is blocked, from the first waiting strip tab, so
+    /// `list` can print WHY without a `status` per task. `None` unless
+    /// `state` is "waiting", and `None` when the agent blocked without
+    /// saying anything.
+    #[serde(default)]
+    pub message: Option<String>,
     /// The strip's terminal tabs in display order (GH #138 part 2): what
     /// `--tab` selectors resolve against and `status` lists. Default so
     /// a not-yet-updated frontend degrades to "no per-tab data" rather
@@ -2921,6 +2930,10 @@ pub struct TabAgentState {
     /// custom terminal, work-done-incapable agents).
     #[serde(default)]
     pub state: Option<String>,
+    /// Why this tab is blocked (the agent's notification body, else its
+    /// live title). `None` unless `state` is "waiting".
+    #[serde(default)]
+    pub message: Option<String>,
     /// Prompts queued behind this tab's current turn.
     #[serde(default)]
     pub queued: u32,
@@ -3031,7 +3044,14 @@ pub(crate) fn cached_work_states(
     let mut out = HashMap::new();
     for id in ids {
         if let Some(s) = snap.states.get(id) {
-            out.insert(id.clone(), WorkStateInfo { state: s.state.clone(), tabs: s.tabs });
+            out.insert(
+                id.clone(),
+                WorkStateInfo {
+                    state: s.state.clone(),
+                    tabs: s.tabs,
+                    message: s.message.clone(),
+                },
+            );
         }
     }
     Some(out)
@@ -3058,6 +3078,7 @@ pub(crate) fn cached_tab_states(
                 agent: t.cli.clone(),
                 title: t.title.clone(),
                 state: t.state.clone(),
+                message: t.message.clone(),
                 is_default: t.is_default,
                 live: t.live,
                 queued: t.queued,
@@ -4027,9 +4048,9 @@ mod tests {
     fn quit_clamps_working_tasks_to_tasks_with_live_agents() {
         let host = StubHost { live_agents: (1, 1), ..Default::default() };
         host.push_states(&[
-            ("w1", TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] }),
+            ("w1", TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] }),
             // Still cached as working, but its agent PTY is already gone.
-            ("w3", TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] }),
+            ("w3", TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] }),
         ]);
         let reply = handle(&req(Command::Quit { commit: false }, Some("tok")), &host);
         let Some(ReplyData::Quit(q)) = reply.data else { panic!("expected quit") };
@@ -4044,8 +4065,8 @@ mod tests {
     fn quit_preview_reports_without_tearing_down() {
         let host = StubHost { live_agents: (2, 3), ..Default::default() };
         host.push_states(&[
-            ("w1", TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] }),
-            ("w3", TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] }),
+            ("w1", TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] }),
+            ("w3", TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] }),
         ]);
         let reply = handle(&req(Command::Quit { commit: false }, Some("tok")), &host);
         assert!(reply.ok, "{reply:?}");
@@ -4092,7 +4113,7 @@ mod tests {
         let host = StubHost { live_agents: (1, 1), ..Default::default() };
         host.push_states(&[(
             "w1",
-            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         // CACHE_STALE_AFTER is 800ms under cfg(test); let it actually go stale
         // rather than reaching into the cache's internals.
@@ -4173,7 +4194,8 @@ mod tests {
     #[test]
     fn list_carries_webview_work_state_when_available() {
         let mut states = HashMap::new();
-        states.insert("w3".to_string(), WorkStateInfo { state: "working".into(), tabs: 2 });
+        states
+            .insert("w3".to_string(), WorkStateInfo { state: "working".into(), tabs: 2, message: None });
         let host = StubHost { states: Some(states), ..Default::default() };
         let reply = handle(&req(Command::List { project: None, quiet: false }, Some("tok")), &host);
         let Some(ReplyData::List(l)) = reply.data else { panic!() };
@@ -4192,7 +4214,7 @@ mod tests {
         let mut states = HashMap::new();
         states.insert(
             "w1".to_string(),
-            TaskAgentState { state: "working".into(), tabs: 2, queued: 1, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "working".into(), tabs: 2, queued: 1, capable: true, message: None, tab_states: vec![] },
         );
         cache.update(states);
         let snap = cache.snapshot();
@@ -4680,12 +4702,12 @@ mod tests {
             host.reports.resolve(&prompt_id, Ok(()));
             host.push_states(&[(
                 "nw1",
-                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             std::thread::sleep(Duration::from_millis(50));
             host.push_states(&[(
                 "nw1",
-                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             let (reply, sink) = handle_thread.join().unwrap();
             let Some(ReplyData::New(n)) = reply.data else { panic!("expected new, got {reply:?}") };
@@ -4739,7 +4761,7 @@ mod tests {
         host.script_rpc("new_task", Ok(serde_json::json!({ "taskId": "nw1" })));
         host.push_states(&[(
             "nw1",
-            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let mut cmd = new_cmd("shiny", Some("web"));
         if let Command::New { prompt, wait, .. } = &mut cmd {
@@ -4763,7 +4785,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(60));
                 host.push_states(&[(
                     "nw1",
-                    TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                    TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
                 )]);
             }
             let reply = t.join().unwrap();
@@ -4783,7 +4805,7 @@ mod tests {
         host.script_rpc("new_task", Ok(serde_json::json!({ "taskId": "nw1" })));
         host.push_states(&[(
             "nw1",
-            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let mut cmd = new_cmd("shiny", Some("web"));
         if let Command::New { prompt, wait, timeout_ms, .. } = &mut cmd {
@@ -4822,7 +4844,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         std::thread::scope(|scope| {
             let t = scope.spawn(|| handle(&req(wait_cmd("solo", None), Some("tok")), &host));
@@ -4831,7 +4853,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(60));
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             let reply = t.join().unwrap();
             let Some(ReplyData::Wait(w)) = reply.data else { panic!("expected wait, got {reply:?}") };
@@ -4866,7 +4888,7 @@ mod tests {
         host.script_rpc("new_task", Ok(serde_json::json!({ "taskId": "nw1" })));
         host.push_states(&[(
             "nw1",
-            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let mut cmd = new_cmd("shiny", Some("web"));
         if let Command::New { prompt, wait, .. } = &mut cmd {
@@ -4891,7 +4913,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let reply = handle(&req(wait_cmd("solo", None), Some("tok")), &host);
         let Some(ReplyData::Wait(w)) = reply.data else { panic!("expected wait, got {reply:?}") };
@@ -4900,7 +4922,7 @@ mod tests {
         // An agent parked on a question maps to needs-input (exit 3).
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "waiting".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "waiting".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let reply = handle(&req(wait_cmd("solo", None), Some("tok")), &host);
         let Some(ReplyData::Wait(w)) = reply.data else { panic!() };
@@ -4912,14 +4934,14 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "inactive".into(), tabs: 0, queued: 0, capable: false, tab_states: vec![] },
+            TaskAgentState { state: "inactive".into(), tabs: 0, queued: 0, capable: false, message: None, tab_states: vec![] },
         )]);
         let err = handle(&req(wait_cmd("solo", None), Some("tok")), &host).error.unwrap();
         assert_eq!(err.code, ErrorCode::Unsupported);
         assert!(err.message.contains("no agent is open"), "{}", err.message);
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: false, tab_states: vec![] },
+            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: false, message: None, tab_states: vec![] },
         )]);
         let err = handle(&req(wait_cmd("solo", None), Some("tok")), &host).error.unwrap();
         assert_eq!(err.code, ErrorCode::Unsupported);
@@ -4933,7 +4955,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "done".into(), tabs: 1, queued: 1, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "done".into(), tabs: 1, queued: 1, capable: true, message: None, tab_states: vec![] },
         )]);
         let reply = handle(&req(wait_cmd("solo", Some(120)), Some("tok")), &host);
         let Some(ReplyData::Wait(w)) = reply.data else { panic!("expected wait, got {reply:?}") };
@@ -4945,7 +4967,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let started = Instant::now();
         let reply = handle(&req(wait_cmd("solo", Some(100)), Some("tok")), &host);
@@ -4959,14 +4981,14 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         std::thread::scope(|scope| {
             let t = scope.spawn(|| handle(&req(wait_cmd("solo", None), Some("tok")), &host));
             std::thread::sleep(Duration::from_millis(60));
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             let reply = t.join().unwrap();
             let Some(ReplyData::Wait(w)) = reply.data else { panic!("expected wait, got {reply:?}") };
@@ -4983,7 +5005,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let started = Instant::now();
         let reply = handle(&req(wait_cmd("solo", None), Some("tok")), &host);
@@ -5002,7 +5024,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         std::thread::sleep(Duration::from_millis(900)); // age past the 800ms test cutoff
         let reply = handle(&req(wait_cmd("solo", None), Some("tok")), &host);
@@ -5018,7 +5040,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w1",
-            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let reply = handle(&req(wait_cmd("solo", None), Some("tok")), &host);
         let err = reply.error.expect("error");
@@ -5091,7 +5113,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let mut sink = VecSink { fail: true, ..Default::default() };
         let started = Instant::now();
@@ -5194,7 +5216,7 @@ mod tests {
         let fresh = AgentSnapshot {
             states: HashMap::from([(
                 "w1".to_string(),
-                TaskAgentState { state: "working".into(), tabs: 2, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "working".into(), tabs: 2, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]),
             age: Some(Duration::from_millis(1)),
         };
@@ -5207,6 +5229,85 @@ mod tests {
         // Never pushed: unknown.
         let never = AgentSnapshot { age: None, ..fresh };
         assert!(cached_work_states(&never, &ids).is_none());
+    }
+
+    // The waiting reason rides the same cache as the state it explains,
+    // so it must degrade with it: a stale snapshot's reason is exactly
+    // as untrustworthy as its state, and serving one without the other
+    // would have `list` print WHY next to an unknown state.
+    #[test]
+    fn cached_work_states_carries_the_waiting_reason_and_drops_it_when_stale() {
+        let fresh = AgentSnapshot {
+            states: HashMap::from([(
+                "w1".to_string(),
+                TaskAgentState {
+                    state: "waiting".into(),
+                    tabs: 1,
+                    queued: 0,
+                    capable: true,
+                    message: Some("needs your permission to run rm".into()),
+                    tab_states: vec![],
+                },
+            )]),
+            age: Some(Duration::from_millis(1)),
+        };
+        let ids = vec!["w1".to_string()];
+        let out = cached_work_states(&fresh, &ids).expect("fresh cache answers");
+        assert_eq!(out["w1"].message.as_deref(), Some("needs your permission to run rm"));
+        let stale =
+            AgentSnapshot { age: Some(CACHE_STALE_AFTER + Duration::from_millis(1)), ..fresh };
+        assert!(cached_work_states(&stale, &ids).is_none());
+    }
+
+    // The per-tab reason is what makes `status --json` tabs[].message
+    // real; it must survive the map into the wire type intact.
+    #[test]
+    fn cached_tab_states_carries_the_per_tab_reason() {
+        let mut blocked = tab_state("t1", "agent", "claude", "claude", Some("waiting"), true, true);
+        blocked.message = Some("needs your permission".into());
+        let quiet = tab_state("t2", "agent", "codex", "codex", Some("waiting"), true, false);
+        let snap = AgentSnapshot {
+            states: HashMap::from([(
+                "w1".to_string(),
+                TaskAgentState {
+                    state: "waiting".into(),
+                    tabs: 2,
+                    queued: 0,
+                    capable: true,
+                    message: blocked.message.clone(),
+                    tab_states: vec![blocked, quiet],
+                },
+            )]),
+            age: Some(Duration::from_millis(1)),
+        };
+        let tabs = cached_tab_states(&snap, "w1").expect("fresh cache answers");
+        assert_eq!(tabs[0].message.as_deref(), Some("needs your permission"));
+        // A tab that blocked without saying anything stays silent, so
+        // the CLI can tell "no reason" from an invented one.
+        assert!(tabs[1].message.is_none());
+    }
+
+    // The end of the chain the ticket is about: `list` prints WHY.
+    #[test]
+    fn list_carries_the_waiting_reason() {
+        let mut states = HashMap::new();
+        states.insert(
+            "w3".to_string(),
+            WorkStateInfo {
+                state: "waiting".into(),
+                tabs: 1,
+                message: Some("needs your permission to run rm".into()),
+            },
+        );
+        let host = StubHost { states: Some(states), ..Default::default() };
+        let reply = handle(&req(Command::List { project: None, quiet: false }, Some("tok")), &host);
+        let Some(ReplyData::List(l)) = reply.data else { panic!() };
+        let solo = l.tasks.iter().find(|t| t.name == "solo").unwrap();
+        assert_eq!(solo.work_state.as_deref(), Some("waiting"));
+        assert_eq!(solo.message.as_deref(), Some("needs your permission to run rm"));
+        // Unreported tasks carry no reason, exactly as they carry no state.
+        let other = l.tasks.iter().find(|t| t.project == "api").unwrap();
+        assert!(other.message.is_none());
     }
 
     #[test]
@@ -5279,7 +5380,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let (sock, _guard) = spawn_server(host);
         let mut stream = UnixStream::connect(&sock).unwrap();
@@ -5329,7 +5430,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let status = handle(
             &req(
@@ -5552,6 +5653,7 @@ mod tests {
             cli: cli.into(),
             title: title.into(),
             state: state.map(str::to_string),
+            message: None,
             queued: 0,
             capable: state.is_some(),
             live,
@@ -5559,13 +5661,20 @@ mod tests {
         }
     }
 
-    /// Push a per-tab snapshot for one task (aggregate derived).
+    /// Push a per-tab snapshot for one task (aggregate derived). The
+    /// aggregate reason comes off the first waiting tab, exactly as the
+    /// webview derives it (src/lib/cliAgentState.ts), so tests exercise
+    /// the same relationship the app pushes.
     fn push_tabs(host: &StubHost, task: &str, aggregate: &str, tabs: Vec<TabAgentState>) {
         let entry = TaskAgentState {
             state: aggregate.into(),
             tabs: tabs.len() as u32,
             queued: tabs.iter().map(|t| t.queued).sum(),
             capable: tabs.iter().any(|t| t.capable),
+            message: tabs
+                .iter()
+                .find(|t| t.state.as_deref() == Some("waiting"))
+                .and_then(|t| t.message.clone()),
             tab_states: tabs,
         };
         host.cache.update(HashMap::from([(task.to_string(), entry)]));
@@ -6226,12 +6335,12 @@ mod tests {
             host.reports.resolve(&prompt_id, Ok(()));
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             std::thread::sleep(Duration::from_millis(50));
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             let reply = t.join().unwrap();
             let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
@@ -6251,7 +6360,7 @@ mod tests {
         );
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "working".into(), tabs: 1, queued: 1, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "working".into(), tabs: 1, queued: 1, capable: true, message: None, tab_states: vec![] },
         )]);
         let request = req(send_cmd("solo", true), Some("tok"));
         std::thread::scope(|scope| {
@@ -6270,12 +6379,12 @@ mod tests {
             host.reports.resolve(&prompt_id, Ok(()));
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             std::thread::sleep(Duration::from_millis(50));
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             let reply = t.join().unwrap();
             let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
@@ -6298,7 +6407,7 @@ mod tests {
         // Stale state from an earlier turn, pushed before the send.
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "done".into(), tabs: 2, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "done".into(), tabs: 2, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let request = req(send_cmd("solo", true), Some("tok"));
         std::thread::scope(|scope| {
@@ -6319,12 +6428,12 @@ mod tests {
             // The real turn: working, then done.
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "working".into(), tabs: 2, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "working".into(), tabs: 2, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             std::thread::sleep(Duration::from_millis(30));
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "done".into(), tabs: 2, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "done".into(), tabs: 2, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             let reply = t.join().unwrap();
             let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
@@ -6345,7 +6454,7 @@ mod tests {
         );
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "waiting".into(), tabs: 1, queued: 1, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "waiting".into(), tabs: 1, queued: 1, capable: true, message: None, tab_states: vec![] },
         )]);
         let reply = handle(&req(send_cmd("solo", true), Some("tok")), &host);
         let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
@@ -6362,7 +6471,7 @@ mod tests {
         let host = StubHost::default();
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let request = req(wait_cmd("solo", None), Some("tok"));
         std::thread::scope(|scope| {
@@ -6370,7 +6479,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "inactive".into(), tabs: 0, queued: 0, capable: false, tab_states: vec![] },
+                TaskAgentState { state: "inactive".into(), tabs: 0, queued: 0, capable: false, message: None, tab_states: vec![] },
             )]);
             let reply = t.join().unwrap();
             let err = reply.error.expect("error, not a false done");
@@ -6392,7 +6501,7 @@ mod tests {
         );
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "waiting".into(), tabs: 1, queued: 1, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "waiting".into(), tabs: 1, queued: 1, capable: true, message: None, tab_states: vec![] },
         )]);
         let request = req(send_cmd("solo", true), Some("tok"));
         std::thread::scope(|scope| {
@@ -6409,19 +6518,19 @@ mod tests {
             // empties on a non-working agent (the gone-detector arms)...
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             // ...and the report lands a beat later, inside the grace.
             std::thread::sleep(Duration::from_millis(60));
             host.reports.resolve(&prompt_id, Ok(()));
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             std::thread::sleep(Duration::from_millis(30));
             host.push_states(&[(
                 "w3",
-                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
             )]);
             let reply = t.join().unwrap();
             let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
@@ -6484,7 +6593,7 @@ mod tests {
         );
         host.push_states(&[(
             "w3",
-            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, tab_states: vec![] },
+            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
         )]);
         let reply = handle(&req(send_cmd("solo", true), Some("tok")), &host);
         let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
