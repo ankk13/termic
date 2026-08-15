@@ -788,6 +788,10 @@ pub struct TabStatus {
     /// through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// Verbatim attention text when `state == "waiting"`; `None`
+    /// otherwise or when the tab has no settle signal. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     /// The tab send/wait/attach/logs resolve to when `--tab` is absent.
     pub is_default: bool,
     /// A PTY is live in this tab right now (vs a durable tab awaiting

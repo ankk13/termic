@@ -162,7 +162,7 @@ describe("per-tab snapshot (tab_states, GH #138 part 2)", () => {
     const s = statesFor({
       t: [
         term({ cli: "claude", workState: "working" }),
-        term({ cli: "claude", unread: { reason: "attention" } }),
+        term({ cli: "claude", unread: { reason: "attention", message: "Claude needs your permission" } }),
         term({ cli: "claude", workState: "done" }),
         term({ cli: "claude" }),
         term({ cli: "shell", workState: "working" }),
@@ -176,6 +176,13 @@ describe("per-tab snapshot (tab_states, GH #138 part 2)", () => {
     expect(s.t.tab_states.map(t => t.capable)).toEqual(
       [true, true, true, true, false, false],
     );
+    // The attention-text (OSC 9/777 body) only rides along with the
+    // "waiting" tab; every other tab omits the key entirely (not just
+    // undefined-valued - JSON.stringify would drop it either way, but the
+    // CLI reply-building code checks for key presence, not truthiness).
+    expect(s.t.tab_states.map(t => t.message)).toEqual([
+      undefined, "Claude needs your permission", undefined, undefined, undefined, undefined,
+    ]);
   });
 
   it("carries id, per-tab queue, liveness and defaultness for resolution", () => {
