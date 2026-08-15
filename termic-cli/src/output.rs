@@ -126,7 +126,14 @@ fn tab_row(t: &TabStatus) -> String {
     if t.kind == "agent" && !t.live {
         bits.push("not running".into());
     } else if let Some(st) = &t.state {
-        bits.push(st.clone());
+        if st == "waiting" {
+            match &t.message {
+                Some(msg) => bits.push(format!("waiting: {msg}")),
+                None => bits.push(st.clone()),
+            }
+        } else {
+            bits.push(st.clone());
+        }
     }
     if t.queued > 0 {
         bits.push(format!("{} queued", t.queued));
@@ -633,6 +640,7 @@ mod tests {
         agent: &str,
         title: &str,
         state: Option<&str>,
+        message: Option<&str>,
         is_default: bool,
         live: bool,
         queued: u32,
@@ -644,6 +652,7 @@ mod tests {
             agent: agent.into(),
             title: title.into(),
             state: state.map(str::to_string),
+            message: message.map(str::to_string),
             is_default,
             live,
             queued,
@@ -739,13 +748,19 @@ created:     2026-01-01T00:00:00Z";
             sessions: 2,
             dirty_files: Some(4),
             tabs: Some(vec![
-                tab_status(1, "agent", "claude", "claude", Some("working"), true, true, 0),
-                tab_status(2, "agent", "codex", "fixing tests", Some("done"), false, true, 1),
-                tab_status(3, "shell", "shell", "Terminal", None, false, true, 0),
+                tab_status(1, "agent", "claude", "claude", Some("working"), None, true, true, 0),
+                tab_status(2, "agent", "codex", "fixing tests", Some("done"), None, false, true, 1),
+                tab_status(3, "shell", "shell", "Terminal", None, None, false, true, 0),
                 // Dead tab still carrying a stale workState (a stopped
                 // task keeps it): liveness must outrank it, or the row
                 // reads "done" and invites a send that errors.
-                tab_status(4, "agent", "claude", "claude", Some("done"), false, false, 0),
+                tab_status(4, "agent", "claude", "claude", Some("done"), None, false, false, 0),
+                // Waiting + a message (OSC 9/777 body): the human status
+                // text surfaces it inline, not just --json.
+                tab_status(
+                    5, "agent", "claude", "claude", Some("waiting"),
+                    Some("Claude needs your permission to edit auth.py"), false, true, 0,
+                ),
             ]),
         };
         let out = status_text(&t);
@@ -753,7 +768,8 @@ created:     2026-01-01T00:00:00Z";
 tabs:        [1] claude (claude, working, default)
              [2] fixing tests (codex, done, 1 queued)
              [3] Terminal (shell)
-             [4] claude (claude, not running)";
+             [4] claude (claude, not running)
+             [5] claude (claude, waiting: Claude needs your permission to edit auth.py)";
         assert!(out.contains(expected), "{out}");
     }
 
@@ -1002,9 +1018,9 @@ commits:
             dirty_files: Some(4),
             // Sweeps the tab rows too (every branch of tab_row).
             tabs: Some(vec![
-                tab_status(1, "agent", "claude", "claude", Some("working"), true, true, 2),
-                tab_status(2, "shell", "shell", "Terminal", None, false, true, 0),
-                tab_status(3, "agent", "codex", "codex", None, false, false, 0),
+                tab_status(1, "agent", "claude", "claude", Some("working"), None, true, true, 2),
+                tab_status(2, "shell", "shell", "Terminal", None, None, false, true, 0),
+                tab_status(3, "agent", "codex", "codex", None, None, false, false, 0),
             ]),
         };
         let wait = WaitResult { outcome: WaitOutcome::Timeout, state: None, detail: None };

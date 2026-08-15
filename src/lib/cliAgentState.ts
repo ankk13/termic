@@ -50,6 +50,9 @@ export interface TabAgentState {
   /** Per-tab work state; null when the tab has no settle signal (shell,
    *  custom terminal, work-done-incapable agent). */
   state: string | null;
+  /** Verbatim attention text (OSC 9/777 body) when state is "waiting";
+   *  omitted otherwise. Mirrors TerminalTab.unread.message. */
+  message?: string;
   /** Prompts queued behind this tab's current turn. */
   queued: number;
   /** Work-done detection exists for this tab's cli. */
@@ -72,12 +75,14 @@ export function computeTabState(t: TerminalTab, agents: AppState["agents"]): Tab
     : t.unread?.reason === "attention" ? "waiting"
     : t.workState === "done" ? "done"
     : "idle";
+  const message = state === "waiting" ? t.unread?.message : undefined;
   return {
     id: t.id,
     kind,
     cli: t.cli,
     title: t.title || t.cli,
     state,
+    ...(message !== undefined ? { message } : {}),
     queued: t.queue?.length ?? 0,
     capable,
     live: !!t.ptyId,
