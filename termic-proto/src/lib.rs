@@ -1513,6 +1513,7 @@ mod tests {
                             agent: "claude".into(),
                             title: "claude".into(),
                             state: Some("working".into()),
+                            message: None,
                             is_default: true,
                             live: true,
                             queued: 1,
@@ -1524,6 +1525,24 @@ mod tests {
                             agent: "shell".into(),
                             title: "Terminal".into(),
                             state: None,
+                            message: None,
+                            is_default: false,
+                            live: true,
+                            queued: 0,
+                        },
+                        // A waiting tab, so the round trip covers `message`
+                        // actually being carried. It is
+                        // skip_serializing_if = "Option::is_none", so the two
+                        // tabs above exercise its absence from the wire and
+                        // never its presence.
+                        TabStatus {
+                            id: "t3".into(),
+                            index: 3,
+                            kind: "agent".into(),
+                            agent: "codex".into(),
+                            title: "codex".into(),
+                            state: Some("waiting".into()),
+                            message: Some("Approve the plan? (y/n)".into()),
                             is_default: false,
                             live: true,
                             queued: 0,
