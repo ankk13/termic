@@ -100,6 +100,20 @@ describe("spawnArgsForCli", () => {
     expect(args).toContain("--resume");
   });
 
+  it("never composes --settings: plan capture is injected backend-side", () => {
+    // The plan-capture hook is prepended in Rust (pty_spawn -> plan_hook.rs)
+    // so the bundled CLI path is resolved at spawn time and can't go stale
+    // across an app update, and so users can't accidentally edit it away in
+    // Settings -> Agent CLIs. If someone re-adds it as a capability here,
+    // claude would receive two --settings and silently lose one.
+    const fakeTask = { id: "ws1", name: "Improve Tests", branch: "main", port: 1420 } as any;
+    const args = spawnArgsForCli("claude", {
+      yolo: true, resume: true, isPrimary: true, task: fakeTask,
+    });
+    expect(args).not.toContain("--settings");
+    expect(args.some(a => a.startsWith("--settings"))).toBe(false);
+  });
+
   it("omits name_args for secondary (+) tabs", () => {
     const fakeTask = { id: "ws1", name: "Improve Tests", branch: "main", port: 1420 } as any;
     // Secondary tabs (isPrimary falsy) start fresh and never carry --name.

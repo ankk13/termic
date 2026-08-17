@@ -700,6 +700,10 @@ mod tests {
         kind: &str,
         agent: &str,
         title: &str,
+        // No `message` parameter: ti-17 expresses the blocked case through the
+        // waiting_tab helper below, so every plain tab_status row is a tab with
+        // nothing to say. Main's variant took it as a 9th argument, which no
+        // call site here passes.
         state: Option<&str>,
         is_default: bool,
         live: bool,
@@ -898,6 +902,12 @@ created:     2026-01-01T00:00:00Z";
                 // task keeps it): liveness must outrank it, or the row
                 // reads "done" and invites a send that errors.
                 tab_status(4, "agent", "claude", "claude", Some("done"), false, false, 0),
+                // Waiting + a message (OSC 9/777 body): the human status
+                // text surfaces it inline, not just --json. Expressed with
+                // waiting_tab, which is how this branch says "blocked, and
+                // here is why"; main spelled the same case as a 9th
+                // tab_status argument.
+                waiting_tab(5, "claude", "Claude needs your permission to edit auth.py"),
             ]),
         };
         let out = status_text(&t);
@@ -905,7 +915,8 @@ created:     2026-01-01T00:00:00Z";
 tabs:        [1] claude (claude, working, default)
              [2] fixing tests (codex, done, 1 queued)
              [3] Terminal (shell)
-             [4] claude (claude, not running)";
+             [4] claude (claude, not running)
+             [5] claude (claude, waiting, Claude needs your permission to edit auth.py)";
         assert!(out.contains(expected), "{out}");
     }
 

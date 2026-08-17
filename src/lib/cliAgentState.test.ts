@@ -162,7 +162,7 @@ describe("per-tab snapshot (tab_states, GH #138 part 2)", () => {
     const s = statesFor({
       t: [
         term({ cli: "claude", workState: "working" }),
-        term({ cli: "claude", unread: { reason: "attention" } }),
+        term({ cli: "claude", unread: { reason: "attention", message: "Claude needs your permission" } }),
         term({ cli: "claude", workState: "done" }),
         term({ cli: "claude" }),
         term({ cli: "shell", workState: "working" }),
@@ -176,6 +176,15 @@ describe("per-tab snapshot (tab_states, GH #138 part 2)", () => {
     expect(s.t.tab_states.map(t => t.capable)).toEqual(
       [true, true, true, true, false, false],
     );
+    // The attention text only rides along with the "waiting" tab. The key is
+    // always present and null elsewhere, rather than omitted: this branch
+    // types it `message: string | null` and computes it for every tab, where
+    // main spread it in conditionally as `message?: string`. Both are safe on
+    // the Rust side, which reads it as Option<String> with #[serde(default)],
+    // so a missing key and an explicit null both deserialize to None.
+    expect(s.t.tab_states.map(t => t.message)).toEqual([
+      null, "Claude needs your permission", null, null, null, null,
+    ]);
   });
 
   it("carries the agent's own reason for blocking, verbatim", () => {

@@ -96,6 +96,7 @@ export function computeTabState(t: TerminalTab, agents: AppState["agents"]): Tab
     : t.unread?.reason === "attention" ? "waiting"
     : t.workState === "done" ? "done"
     : "idle";
+  const message = state === "waiting" ? t.unread?.message : undefined;
   return {
     id: t.id,
     kind,

@@ -146,6 +146,18 @@ export async function clickByText(text: string): Promise<void> {
 }
 
 /**
+ * Switch the right panel between "All files" and "Git".
+ *
+ * Not `clickByText("Git")`: that tab's badges are part of its textContent, so
+ * the moment the working tree is dirty the label reads "Git3" and an exact
+ * text match finds nothing. Keys on the `data-rtab` handle instead, which is
+ * stable whatever the badges say.
+ */
+export async function clickRightPanelTab(view: "files" | "changes"): Promise<void> {
+  await clickWhenVisible(`[data-rtab="${view}"]`);
+}
+
+/**
  * Click a dropdown/menu entry by its exact visible text. Scoped to
  * `[role='menuitem']` so it never collides with same-named buttons elsewhere
  * (e.g. the footer "Terminal" vs. the "+" menu's "Terminal").

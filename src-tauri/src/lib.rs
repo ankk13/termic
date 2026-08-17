@@ -33,6 +33,7 @@ use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 mod sandbox;
+mod plan_hook;
 mod proxy;
 mod repo_config;
 mod shell_env;
@@ -1860,7 +1861,7 @@ fn pty_alive(state: State<'_, PtyManager>, id: String) -> bool {
 fn pty_spawn(
     app: AppHandle,
     state: State<'_, PtyManager>,
-    args: SpawnArgs,
+    mut args: SpawnArgs,
 ) -> Result<SpawnResult, String> {
     let pty = NativePtySystem::default();
     let pair = pty
@@ -1871,6 +1872,31 @@ fn pty_spawn(
             pixel_height: 0,
         })
         .map_err(|e| e.to_string())?;
+
+    // ── Plan capture (claude only) ─────────────────────────────────
+    // Prepend `--settings <inline json>` so claude drops the plan it is
+    // about to present into `.context/plans/` (plan_hook.rs). Must land
+    // BEFORE the sandbox wrap below, which rewrites (cmd, args) into a
+    // `sandbox-exec …` argv and would otherwise bury our flag.
+    //
+    // FRONT, not back: prepending can never be swallowed by a trailing
+    // positional or by a subcommand-style resume block, and claude accepts
+    // root globals anywhere.
+    //
+    // Gated on `task_id` because that is exactly the gate that provides
+    // TERMIC_CONTEXT_DIR below, which the hook needs; shell tabs and
+    // run/setup script tabs are excluded for free. Deliberately NOT gated
+    // on `cli_enabled` (unlike TERMIC_CLI further down): `capture-plan`
+    // touches no socket and is not part of the control-plane surface.
+    if args.task_id.is_some() && load_settings_inner().capture_plans != Some(false) {
+        if let Ok(cli) = cli_server::bundled_cli_path() {
+            if let Some(extra) =
+                plan_hook::plan_capture_args(args.agent_id.as_deref(), &args.cmd, &args.args, &cli)
+            {
+                args.args.splice(0..0, extra);
+            }
+        }
+    }
 
     // ── Sandbox wrap, if applicable ────────────────────────────────
     // If the task is flagged sandbox_enabled, provision a fresh
@@ -1987,6 +2013,24 @@ fn pty_spawn(
         if let Some(name) = &task_name {
             cmd.env("TERMIC_TASK", name);
         }
+        // Cross-session scratch dir (plans/todos/session-summaries) —
+        // lazy here, not just at task creation, so tasks created before
+        // this feature shipped pick it up on their next agent spawn,
+        // no migration step needed. Gated the same as TERMIC_TASK_ID:
+        // ad-hoc uncaged shells and run/setup script tabs don't get it.
+        let cwd_path = Path::new(&args.cwd);
+        if let Err(e) = ensure_context_dirs(cwd_path) {
+            dlog(&format!("[pty_spawn] context dir scaffold failed (non-fatal): {e}"));
+        }
+        ensure_context_gitignore(cwd_path);
+        cmd.env(
+            "TERMIC_CONTEXT_DIR",
+            cwd_path.join(".context").to_string_lossy().into_owned(),
+        );
+        cmd.env(
+            "TERMIC_CONTEXT_HELP",
+            "TERMIC_CONTEXT_DIR holds cross-session scratch for THIS worktree (other agent tabs may be running here concurrently). Before planning, check .context/plans, .context/todos, and .context/session-summaries for sibling sessions' in-flight work. When you produce a plan, a todo list, or finish a session, write it there as <ISO-timestamp>_<slug>.md (your session id is $TERMIC_SESSION_ID) so other sessions can find it.",
+        );
     }
     if load_settings_inner().cli_enabled {
         if let Ok(cli) = cli_server::bundled_cli_path() {
@@ -3176,6 +3220,14 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
             .map_err(|e| format!("git-crypt setup: post-symlink checkout failed: {e}"))?;
     }
 
+    // Cross-session scratch dir (plans/todos/session-summaries) for
+    // agent tabs sharing this worktree. Best-effort: a failure here
+    // shouldn't fail task creation.
+    if let Err(e) = ensure_context_dirs(&wt_path) {
+        eprintln!("context dir scaffold failed (non-fatal): {e}");
+    }
+    ensure_context_gitignore(&wt_path);
+
     // Copy files_to_copy (glob patterns relative to repo root) —
     // the repo's `.termic.yaml` list merged with the project override.
     for pat in &effective_files_to_copy(&proj) {
@@ -3572,6 +3624,17 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         }
     }
 
+    // Cross-session scratch dir at the wrapper root — task.path for a
+    // multi-repo task IS the wrapper, so this is where every agent tab's
+    // cwd lands. Gitignore needs a real git repo to resolve against;
+    // skip it for a non-git host (the wrapper isn't tracked at all there).
+    if let Err(e) = ensure_context_dirs(&wrapper) {
+        eprintln!("context dir scaffold failed (non-fatal): {e}");
+    }
+    if !host.non_git {
+        ensure_context_gitignore(&wrapper);
+    }
+
     // Auto-commit the wrapper's bookkeeping files (CLAUDE.md /
     // AGENTS.md / .gitignore / agent dirs) so they don't show up as
     // ?? noise in the Changes view. The user is here to work on
@@ -3773,6 +3836,59 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
     }
 
     Ok(task)
+}
+
+/// Create `<path>/.context/{plans,todos,session-summaries}/` — shared
+/// cross-session scratch for this task. A task's cwd can host several
+/// concurrent agent tabs (each with its own `PersistedTab.session_id`),
+/// and this is where one session drops a plan / todo list / summary for
+/// a sibling session (or a later one) to find. Idempotent: safe to call
+/// on every task open, not just creation, so pre-existing tasks pick it
+/// up lazily via `pty_spawn` without a migration step.
+fn ensure_context_dirs(path: &Path) -> std::io::Result<()> {
+    for sub in ["plans", "todos", "session-summaries"] {
+        fs::create_dir_all(path.join(".context").join(sub))?;
+    }
+    Ok(())
+}
+
+/// Exclude `.context/` from git via the repo's SHARED `.git/info/exclude`
+/// rather than a tracked `.gitignore`: `info/exclude` lives in the common
+/// gitdir (`git rev-parse --git-common-dir`), so one write covers every
+/// worktree of this repo, is never committed, and never shows up as a
+/// diff — apt for scratch state that's ephemeral and same-machine only.
+/// The block content never varies, so unlike `ensure_multirepo_gitignore`
+/// this only needs to check presence, not reconcile a changing list.
+/// Best-effort: a `path` with no resolvable git-common-dir (shouldn't
+/// happen for a real worktree/checkout) just no-ops.
+fn ensure_context_gitignore(path: &Path) {
+    const BEGIN: &str = "# ── termic: context dir (managed) ──";
+    const END: &str = "# ── /termic ──";
+    let Ok(common) = git(&["rev-parse", "--git-common-dir"], path) else { return };
+    let common = {
+        let p = PathBuf::from(common.trim());
+        if p.is_absolute() { p } else { path.join(p) }
+    };
+    let exclude_path = common.join("info").join("exclude");
+    if let Some(parent) = exclude_path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let prior = fs::read_to_string(&exclude_path).unwrap_or_default();
+    if prior.lines().any(|l| l.trim() == BEGIN) {
+        return; // already installed
+    }
+    let mut next = prior;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(BEGIN);
+    next.push('\n');
+    next.push_str(".context/\n");
+    next.push_str(END);
+    next.push('\n');
+    let _ = fs::write(&exclude_path, next);
 }
 
 /// Rewrite (or insert) a fenced Termic-managed block at the bottom of
@@ -8726,6 +8842,16 @@ pub struct Settings {
     /// pre-filled, not off, so upgraders keep the original behavior.
     #[serde(default = "default_worktree_symlink_paths")]
     pub worktree_symlink_paths: Vec<String>,
+    /// Whether a claude agent's plan-mode plan is copied into the task's
+    /// `.context/plans/` as it is presented (plan_hook.rs). `None`/absent
+    /// means on, the `tray_enabled` tri-state, so upgraders get it.
+    ///
+    /// This is the one feature that rewrites the user's agent argv (it adds
+    /// `--settings`), so it needs an off switch that isn't an app downgrade:
+    /// a claude build that ever rejected the flag would otherwise fail to
+    /// start with no way out from inside the app.
+    #[serde(default)]
+    pub capture_plans: Option<bool>,
 }
 
 /// Whether the pre-create base fetch (GH #79) is enabled. Default-on: only an
@@ -11769,6 +11895,65 @@ mod tests {
         assert!(s.contains("secrets.env"));
         assert!(s.contains("/y"));
         assert!(!s.contains("/x"));
+    }
+
+    #[test]
+    fn context_dirs_creates_all_three_subdirs() {
+        let dir = tempdir().unwrap();
+        ensure_context_dirs(dir.path()).unwrap();
+        for sub in ["plans", "todos", "session-summaries"] {
+            assert!(dir.path().join(".context").join(sub).is_dir(), "missing .context/{sub}");
+        }
+    }
+
+    #[test]
+    fn context_dirs_idempotent() {
+        let dir = tempdir().unwrap();
+        ensure_context_dirs(dir.path()).unwrap();
+        ensure_context_dirs(dir.path()).unwrap(); // second call must not error
+        assert!(dir.path().join(".context").join("plans").is_dir());
+    }
+
+    #[test]
+    fn context_gitignore_writes_to_shared_info_exclude_not_tracked_gitignore() {
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        ensure_context_gitignore(dir.path());
+        let exclude = fs::read_to_string(dir.path().join(".git").join("info").join("exclude")).unwrap();
+        assert!(exclude.contains("# ── termic: context dir (managed) ──"));
+        assert!(exclude.contains(".context/"));
+        assert!(exclude.contains("# ── /termic ──"));
+        // Never touches a tracked .gitignore.
+        assert!(!dir.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn context_gitignore_idempotent_no_duplicate_block() {
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        ensure_context_gitignore(dir.path());
+        ensure_context_gitignore(dir.path());
+        let exclude = fs::read_to_string(dir.path().join(".git").join("info").join("exclude")).unwrap();
+        assert_eq!(exclude.matches("# ── termic: context dir (managed) ──").count(), 1);
+    }
+
+    #[test]
+    fn context_gitignore_preserves_existing_exclude_content() {
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        let exclude_path = dir.path().join(".git").join("info").join("exclude");
+        fs::write(&exclude_path, "*.local\n").unwrap();
+        ensure_context_gitignore(dir.path());
+        let exclude = fs::read_to_string(&exclude_path).unwrap();
+        assert!(exclude.contains("*.local"));
+        assert!(exclude.contains(".context/"));
+    }
+
+    #[test]
+    fn context_gitignore_noop_outside_git_repo() {
+        let dir = tempdir().unwrap();
+        ensure_context_gitignore(dir.path()); // no git repo here: must not panic
+        assert!(!dir.path().join(".git").exists());
     }
 
     #[test]

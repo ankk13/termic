@@ -37,7 +37,10 @@ use std::io::{self, BufRead, Read, Write};
 /// v6 (GH #138 part 2): `tab` selectors (`tab` field on send / wait /
 /// attach / logs), `TaskStatus.tabs`, and `tab -p` (prompt fields on the
 /// `tab` command, `TabData.prompt`).
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// v7: the `watch` verb (stream task work-state transitions to external
+/// automation): the `task_state` stream event and the `WatchData` reply.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// serde default for `QuitData::running`.
 pub(crate) fn default_true() -> bool { true }
@@ -237,6 +240,21 @@ pub enum Command {
         /// The CLI's working directory, for worktree-first resolution.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+    },
+    /// Stream task work-state transitions until the client disconnects
+    /// or `timeout_ms` passes. Streamed reply: one `task_state` event per
+    /// task up front (the snapshot a consumer starts from), one more per
+    /// transition, heartbeats in between, then the final Reply. The
+    /// external-automation surface: a ticket bridge or dashboard
+    /// subscribes here instead of polling `list`.
+    Watch {
+        /// Only tasks of this project (name or id). Absent = every task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// End the stream cleanly (final Reply, `reason: "timeout"`)
+        /// after this long. Absent = run until the connection drops.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
     /// List the agent registry: what `--agent` / `--terminal` accept.
     /// Answers "what can I pass?", which was otherwise only discoverable
@@ -497,6 +515,7 @@ pub enum ReplyData {
     Open(OpenData),
     New(NewData),
     Wait(WaitData),
+    Watch(WatchData),
     Agents(AgentsData),
     Tab(TabData),
     Quit(QuitData),
@@ -566,6 +585,15 @@ pub struct WaitData {
     pub task_id: String,
     #[serde(flatten)]
     pub result: WaitResult,
+}
+
+/// Final reply of a `watch` stream: why it ended and how many
+/// `task_state` events were emitted before that.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WatchData {
+    pub events: u64,
+    /// "timeout" | "client disconnected".
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -963,8 +991,8 @@ pub struct StreamEvent {
     /// Always true; discriminates an event line from the final Reply.
     pub stream: bool,
     /// "setup_output" | "created" | "prompt_delivered" | "queued" |
-    /// "state" | "heartbeat". New tags may appear; skip what you
-    /// don't know.
+    /// "state" | "task_state" | "heartbeat". New tags may appear; skip
+    /// what you don't know.
     pub event: String,
     /// setup_output: raw script output (UTF-8 lossy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1003,6 +1031,13 @@ impl StreamEvent {
     }
     pub fn state(id: &str, state: String) -> Self {
         StreamEvent { state: Some(state), ..Self::base(id, "state") }
+    }
+    /// `watch`: one task's work-state, both the initial snapshot and
+    /// every later transition. `state` mirrors the aggregated work-state
+    /// vocabulary ("working" / "waiting" / "done" / "idle" /
+    /// "inactive"), plus "archived" once when the task goes away.
+    pub fn task_state(id: &str, task: TaskSummary, state: String) -> Self {
+        StreamEvent { task: Some(task), state: Some(state), ..Self::base(id, "task_state") }
     }
     pub fn heartbeat(id: &str) -> Self {
         Self::base(id, "heartbeat")
@@ -1467,8 +1502,19 @@ mod tests {
             work_state: Some("working".into()),
             open_tabs: Some(2),
             diff: Some(DiffStat { files_changed: 3, insertions: 10, deletions: 2, untracked: 1 }),
+            // None is the correct value for a task that is working, not
+            // waiting. The waiting case is covered by `blocked` below.
+            message: None,
+        };
+        // `message` is skip_serializing_if = "Option::is_none", so a summary
+        // that never sets it proves nothing about how it crosses the wire.
+        let blocked = TaskSummary {
+            work_state: Some("waiting".into()),
+            message: Some("Approve the plan? (y/n)".into()),
+            ..summary.clone()
         };
         for data in [
+            ReplyData::List(ListData { tasks: vec![blocked.clone()] }),
             ReplyData::Hello(HelloData {
                 app: "termic".into(),
                 app_version: "1.0.0".into(),
@@ -1489,6 +1535,7 @@ mod tests {
                             agent: "claude".into(),
                             title: "claude".into(),
                             state: Some("working".into()),
+                            message: None,
                             is_default: true,
                             live: true,
                             queued: 1,
@@ -1500,6 +1547,24 @@ mod tests {
                             agent: "shell".into(),
                             title: "Terminal".into(),
                             state: None,
+                            message: None,
+                            is_default: false,
+                            live: true,
+                            queued: 0,
+                        },
+                        // A waiting tab, so the round trip covers `message`
+                        // actually being carried. It is
+                        // skip_serializing_if = "Option::is_none", so the two
+                        // tabs above exercise its absence from the wire and
+                        // never its presence.
+                        TabStatus {
+                            id: "t3".into(),
+                            index: 3,
+                            kind: "agent".into(),
+                            agent: "codex".into(),
+                            title: "codex".into(),
+                            state: Some("waiting".into()),
+                            message: Some("Approve the plan? (y/n)".into()),
                             is_default: false,
                             live: true,
                             queued: 0,
@@ -1646,9 +1711,10 @@ mod tests {
         let task = TaskSummary { id: "w1".into(), name: "fix-auth".into(), ..Default::default() };
         for ev in [
             StreamEvent::setup_output("r1", "npm install\n".into()),
-            StreamEvent::created("r1", task),
+            StreamEvent::created("r1", task.clone()),
             StreamEvent::prompt_delivered("r1"),
             StreamEvent::state("r1", "working".into()),
+            StreamEvent::task_state("r1", task, "waiting".into()),
             StreamEvent::heartbeat("r1"),
         ] {
             roundtrip(&ev);
@@ -1671,6 +1737,22 @@ mod tests {
             StreamLine::Done(back) => assert_eq!(back, reply),
             other => panic!("expected done, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn roundtrip_watch_command_and_reply() {
+        // The wire shape of the v7 watch surface: request with and
+        // without its optional fields, and the final WatchData reply.
+        for cmd in [
+            Command::Watch { project: None, timeout_ms: None },
+            Command::Watch { project: Some("web".into()), timeout_ms: Some(60_000) },
+        ] {
+            roundtrip(&Request { id: "1".into(), token: Some("tok".into()), cmd });
+        }
+        roundtrip(&Reply::ok(
+            "1",
+            ReplyData::Watch(WatchData { events: 4, reason: "timeout".into() }),
+        ));
     }
 
     #[test]

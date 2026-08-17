@@ -645,6 +645,9 @@ pub(crate) fn handle_request(req: &Request, host: &dyn CliHost, sink: &mut dyn E
                 sink,
             )
         }
+        Command::Watch { project, timeout_ms } => {
+            handle_watch(&req.id, host, project.as_deref(), *timeout_ms, sink)
+        }
         Command::Quit { commit } => {
             let (tasks_with_agents, live_agents) = host.live_agent_counts();
             // Working count comes from the webview cache - only it knows
@@ -715,6 +718,151 @@ pub(crate) fn handle_request(req: &Request, host: &dyn CliHost, sink: &mut dyn E
         Command::LastResult { task, project, cwd } => {
             handle_result(&req.id, host, task.as_deref(), project.as_deref(), cwd.as_deref())
         }
+    }
+}
+
+/// Stream every task's work-state (initial snapshot, then transitions)
+/// until the client hangs up or the optional deadline passes. Rides the
+/// same webview-pushed cache `wait` blocks on, with the same condvar
+/// wake (`wait_change`) rather than a sleep poll, and the same staleness
+/// honesty: a webview that stops reporting ends the stream with an error
+/// instead of a frozen silence the consumer would read as "all quiet".
+fn handle_watch(
+    id: &str,
+    host: &dyn CliHost,
+    project: Option<&str>,
+    timeout_ms: Option<u64>,
+    sink: &mut dyn EventSink,
+) -> Reply {
+    // Resolve the optional project filter up front: a typo'd name must be
+    // a clean not-found, never a silently empty stream.
+    let project_id = match project {
+        None => None,
+        Some(name) => {
+            let (projects, _) = host.projects_tasks();
+            match find_project(&projects, name) {
+                Some(p) => Some(p.id.clone()),
+                None => {
+                    return Reply::err(id, ErrorCode::NotFound, format!("no project named \"{name}\""));
+                }
+            }
+        }
+    };
+    let cache = host.agent_cache();
+    let started = Instant::now();
+    let deadline = timeout_ms.map(|ms| started + Duration::from_millis(ms));
+    let mut last_seq = 0u64;
+    let mut last_heartbeat = Instant::now();
+    // task id -> last emitted state; a change (or first sight) emits.
+    let mut last_states: HashMap<String, String> = HashMap::new();
+    // Retained so a task that vanishes (archived) can still be named in
+    // its final "archived" event.
+    let mut summaries: HashMap<String, proto::TaskSummary> = HashMap::new();
+    let mut events: u64 = 0;
+    loop {
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                return Reply::ok(
+                    id,
+                    ReplyData::Watch(proto::WatchData { events, reason: "timeout".into() }),
+                );
+            }
+        }
+        let snap = cache.snapshot();
+        match snap.age {
+            None => {
+                // Same populate grace as `wait`: the app may still be
+                // booting; continuously absent past it is an error.
+                if started.elapsed() > POPULATE_GRACE {
+                    return Reply::err(
+                        id,
+                        ErrorCode::Internal,
+                        "the Termic UI has not reported agent state (is the app still starting?)",
+                    );
+                }
+            }
+            Some(age) => {
+                if age > CACHE_STALE_AFTER {
+                    return Reply::err(
+                        id,
+                        ErrorCode::Internal,
+                        "the Termic UI stopped reporting agent state",
+                    );
+                }
+                let (projects, mut tasks) = host.projects_tasks();
+                tasks.retain(|t| !t.archived);
+                if let Some(pid) = &project_id {
+                    tasks.retain(|t| &t.project_id == pid);
+                }
+                let ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+                let states = cached_work_states(&snap, &ids);
+                for t in &tasks {
+                    // No cache entry = no agent tab open: the same
+                    // "inactive" meaning list/status render.
+                    let state = snap
+                        .states
+                        .get(&t.id)
+                        .map(|s| s.state.clone())
+                        .unwrap_or_else(|| "inactive".to_string());
+                    if last_states.get(&t.id) != Some(&state) {
+                        let summary = summarize(t, &projects, states.as_ref(), None);
+                        if sink
+                            .emit(&StreamEvent::task_state(id, summary.clone(), state.clone()))
+                            .is_err()
+                        {
+                            return Reply::ok(
+                                id,
+                                ReplyData::Watch(proto::WatchData {
+                                    events,
+                                    reason: "client disconnected".into(),
+                                }),
+                            );
+                        }
+                        events += 1;
+                        last_states.insert(t.id.clone(), state);
+                        summaries.insert(t.id.clone(), summary);
+                    }
+                }
+                // A task that dropped out of the live list was archived
+                // (or deleted): one final event so a consumer can close
+                // out whatever it mapped the task to.
+                let gone: Vec<String> =
+                    last_states.keys().filter(|k| !ids.contains(k)).cloned().collect();
+                for gid in gone {
+                    last_states.remove(&gid);
+                    if let Some(summary) = summaries.remove(&gid) {
+                        if sink
+                            .emit(&StreamEvent::task_state(id, summary, "archived".into()))
+                            .is_err()
+                        {
+                            return Reply::ok(
+                                id,
+                                ReplyData::Watch(proto::WatchData {
+                                    events,
+                                    reason: "client disconnected".into(),
+                                }),
+                            );
+                        }
+                        events += 1;
+                    }
+                }
+            }
+        }
+        if last_heartbeat.elapsed() >= HEARTBEAT_EVERY {
+            last_heartbeat = Instant::now();
+            if sink.emit(&StreamEvent::heartbeat(id)).is_err() {
+                return Reply::ok(
+                    id,
+                    ReplyData::Watch(proto::WatchData {
+                        events,
+                        reason: "client disconnected".into(),
+                    }),
+                );
+            }
+        }
+        // Condvar wake on the next webview push, sliced so deadlines and
+        // heartbeats stay responsive (never a thread::sleep poll loop).
+        last_seq = cache.wait_change(last_seq, CV_SLICE);
     }
 }
 
@@ -5263,9 +5411,14 @@ mod tests {
     // real; it must survive the map into the wire type intact.
     #[test]
     fn cached_tab_states_carries_the_per_tab_reason() {
-        let mut blocked = tab_state("t1", "agent", "claude", "claude", Some("waiting"), true, true);
-        blocked.message = Some("needs your permission".into());
-        let quiet = tab_state("t2", "agent", "codex", "codex", Some("waiting"), true, false);
+        // The reason goes through the helper now: this branch's tab_state
+        // takes it as an argument, where main built the tab and then assigned
+        // .message afterwards.
+        let blocked = tab_state(
+            "t1", "agent", "claude", "claude", Some("waiting"),
+            Some("needs your permission"), true, true,
+        );
+        let quiet = tab_state("t2", "agent", "codex", "codex", Some("waiting"), None, true, false);
         let snap = AgentSnapshot {
             states: HashMap::from([(
                 "w1".to_string(),
@@ -5407,6 +5560,108 @@ mod tests {
     }
 
     // ── project resolution for new ───────────────────────────────────
+
+    fn watch_events_of(sink: &VecSink) -> Vec<(String, String)> {
+        sink.events
+            .iter()
+            .filter(|e| e.event == "task_state")
+            .map(|e| {
+                (
+                    e.task.as_ref().expect("task on task_state").id.clone(),
+                    e.state.clone().expect("state on task_state"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn watch_streams_initial_snapshot_then_transitions_scoped_to_a_project() {
+        let host = StubHost::default();
+        host.push_states(&[(
+            "w1",
+            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
+        )]);
+        let request =
+            req(Command::Watch { project: Some("web".into()), timeout_ms: Some(350) }, Some("tok"));
+        std::thread::scope(|scope| {
+            let t = scope.spawn(|| {
+                let mut sink = VecSink::default();
+                let reply = handle_request(&request, &host, &mut sink);
+                (reply, sink)
+            });
+            std::thread::sleep(Duration::from_millis(120));
+            host.push_states(&[(
+                "w1",
+                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
+            )]);
+            let (reply, sink) = t.join().unwrap();
+            let Some(ReplyData::Watch(w)) = reply.data else {
+                panic!("expected watch reply, got {reply:?}")
+            };
+            assert_eq!(w.reason, "timeout");
+            let states = watch_events_of(&sink);
+            // Initial snapshot: w1 from the cache, w3 defaulting to
+            // inactive (no entry = no agent tab open).
+            let idle = states.iter().position(|s| s == &("w1".into(), "idle".into()));
+            let working = states.iter().position(|s| s == &("w1".into(), "working".into()));
+            assert!(idle.is_some(), "initial w1 idle missing: {states:?}");
+            assert!(states.contains(&("w3".into(), "inactive".into())), "{states:?}");
+            assert!(working.is_some(), "w1 working transition missing: {states:?}");
+            assert!(idle < working, "snapshot must precede the transition: {states:?}");
+            // --project web: the api project's task never appears.
+            assert!(!states.iter().any(|(id, _)| id == "w2"), "{states:?}");
+            assert_eq!(w.events, states.len() as u64);
+        });
+    }
+
+    #[test]
+    fn watch_unknown_project_is_not_found() {
+        let host = StubHost::default();
+        let mut sink = VecSink::default();
+        let reply = handle_request(
+            &req(Command::Watch { project: Some("nope".into()), timeout_ms: Some(50) }, Some("tok")),
+            &host,
+            &mut sink,
+        );
+        let err = reply.error.expect("error");
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(sink.events.is_empty(), "no events on a refused watch");
+    }
+
+    #[test]
+    fn watch_errors_when_the_ui_never_reports() {
+        // No push at all: the populate grace expires into an error, well
+        // before the requested timeout (the same honesty rule as wait).
+        let host = StubHost::default();
+        let started = Instant::now();
+        let reply = handle(
+            &req(Command::Watch { project: None, timeout_ms: Some(2000) }, Some("tok")),
+            &host,
+        );
+        let err = reply.error.expect("error");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(started.elapsed() < Duration::from_millis(900), "must not run to the timeout");
+    }
+
+    #[test]
+    fn watch_ends_cleanly_when_the_client_hangs_up() {
+        let host = StubHost::default();
+        host.push_states(&[(
+            "w1",
+            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true, message: None, tab_states: vec![] },
+        )]);
+        let mut sink = VecSink { events: Vec::new(), fail: true };
+        let reply = handle_request(
+            &req(Command::Watch { project: None, timeout_ms: Some(2000) }, Some("tok")),
+            &host,
+            &mut sink,
+        );
+        let Some(ReplyData::Watch(w)) = reply.data else {
+            panic!("expected watch reply, got {reply:?}")
+        };
+        assert_eq!(w.reason, "client disconnected");
+        assert_eq!(w.events, 0, "a failed emit must not count");
+    }
 
     #[test]
     fn resolve_project_for_new_prefers_worktree_then_longest_root() {
@@ -5644,6 +5899,7 @@ mod tests {
         cli: &str,
         title: &str,
         state: Option<&str>,
+        message: Option<&str>,
         live: bool,
         is_default: bool,
     ) -> TabAgentState {
@@ -5653,7 +5909,11 @@ mod tests {
             cli: cli.into(),
             title: title.into(),
             state: state.map(str::to_string),
-            message: None,
+            // Must use the argument. The merge left main's 8-arg signature
+            // paired with ti-17's body, which hardcoded None, so the helper
+            // accepted a reason and threw it away - the compiler's
+            // "unused variable: message" was the only sign.
+            message: message.map(str::to_string),
             queued: 0,
             capable: state.is_some(),
             live,
@@ -5688,9 +5948,9 @@ mod tests {
             "w3",
             "idle",
             vec![
-                tab_state("tab-a", "agent", "claude", "claude", Some("idle"), true, true),
-                tab_state("tab-b", "agent", "codex", "fixing tests", Some("idle"), true, false),
-                tab_state("tab-c", "shell", "shell", "Terminal", None, true, false),
+                tab_state("tab-a", "agent", "claude", "claude", Some("idle"), None, true, true),
+                tab_state("tab-b", "agent", "codex", "fixing tests", Some("idle"), None, true, false),
+                tab_state("tab-c", "shell", "shell", "Terminal", None, None, true, false),
             ],
         );
     }
@@ -5726,8 +5986,8 @@ mod tests {
             "w3",
             "idle",
             vec![
-                tab_state("tab-a", "agent", "claude", "claude", Some("idle"), true, true),
-                tab_state("tab-b", "agent", "claude", "claude", Some("idle"), true, false),
+                tab_state("tab-a", "agent", "claude", "claude", Some("idle"), None, true, true),
+                tab_state("tab-b", "agent", "claude", "claude", Some("idle"), None, true, false),
             ],
         );
         let e = resolve_tab_selector(&host, &w3(&host), "claude").unwrap_err();
@@ -5884,7 +6144,7 @@ mod tests {
             Ok(serde_json::json!({ "mode": "delivered", "capable": true })),
         );
         let stale = |state: &str| {
-            vec![tab_state("tab-b", "agent", "codex", "codex", Some(state), true, false)]
+            vec![tab_state("tab-b", "agent", "codex", "codex", Some(state), None, true, false)]
         };
         push_tabs(&host, "w3", "done", stale("done"));
         let mut cmd = send_cmd("solo", true);
@@ -5927,8 +6187,8 @@ mod tests {
             "w3",
             "working",
             vec![
-                tab_state("tab-a", "agent", "claude", "claude", Some("working"), true, true),
-                tab_state("tab-b", "agent", "codex", "codex", Some("done"), true, false),
+                tab_state("tab-a", "agent", "claude", "claude", Some("working"), None, true, true),
+                tab_state("tab-b", "agent", "codex", "codex", Some("done"), None, true, false),
             ],
         );
         let mut cmd = wait_cmd("solo", Some(2_000));
@@ -5949,10 +6209,10 @@ mod tests {
             "w3",
             "idle",
             vec![
-                tab_state("tab-dead", "agent", "claude", "claude", Some("idle"), false, false),
+                tab_state("tab-dead", "agent", "claude", "claude", Some("idle"), None, false, false),
                 {
                     let mut t =
-                        tab_state("tab-nod", "agent", "nodone", "nodone", None, true, false);
+                        tab_state("tab-nod", "agent", "nodone", "nodone", None, None, true, false);
                     t.capable = false;
                     t
                 },
@@ -5979,7 +6239,7 @@ mod tests {
             &host,
             "w3",
             "working",
-            vec![tab_state("tab-a", "agent", "claude", "claude", Some("working"), true, true)],
+            vec![tab_state("tab-a", "agent", "claude", "claude", Some("working"), None, true, true)],
         );
         let mut cmd = wait_cmd("solo", Some(5_000));
         if let Command::Wait { tab, .. } = &mut cmd {
@@ -6099,6 +6359,36 @@ mod tests {
         assert_eq!(tabs[1].title, "fixing tests");
         assert_eq!(tabs[2].kind, "shell");
         assert!(tabs[0].is_default);
+        // seed_strip's tabs are all idle/no-settle-signal; message is
+        // None on every row here (not just absent from a waiting one).
+        assert!(tabs.iter().all(|t| t.message.is_none()));
+
+        // A waiting tab's attention text (OSC 9/777 body) rides through
+        // to `status --json` (own host/push - seed_strip is shared by
+        // other tests and must stay idle-only).
+        let waiting_host = StubHost::default();
+        push_tabs(
+            &waiting_host,
+            "w3",
+            "waiting",
+            vec![tab_state(
+                "tab-w", "agent", "claude", "claude", Some("waiting"),
+                Some("Claude needs your permission to edit auth.py"), true, true,
+            )],
+        );
+        let reply = handle(
+            &req(
+                Command::Status { task: Some("solo".into()), project: None, cwd: None },
+                Some("tok"),
+            ),
+            &waiting_host,
+        );
+        let Some(ReplyData::Status(s)) = reply.data else { panic!("expected status") };
+        let tabs = s.task.tabs.expect("tabs listed");
+        assert_eq!(
+            tabs[0].message.as_deref(),
+            Some("Claude needs your permission to edit auth.py")
+        );
 
         // No push: UNKNOWN, not an empty strip.
         let silent = StubHost::default();
