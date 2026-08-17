@@ -476,6 +476,13 @@ export interface Settings {
    *  omits it). Pre-filled with the common agent dirs; an empty list disables
    *  the linking. Absent = the pre-filled defaults, not off. */
   worktree_symlink_paths?: string[];
+  /** Whether a claude agent's plan-mode plan is copied into the task's
+   *  `.context/plans/` as it is presented, so it can be read in the file tree
+   *  instead of only in the global `~/.claude/plans`. Absent/true = on; only
+   *  an explicit false turns it off. Implemented backend-side by prepending
+   *  `--settings` to the claude spawn (src-tauri/src/plan_hook.rs), which is
+   *  why it gets an off switch at all. */
+  capture_plans?: boolean;
 }
 
 /** Install state of the bundled CLI on PATH (cli_install_status). */

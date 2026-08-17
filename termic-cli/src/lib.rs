@@ -2,7 +2,7 @@
 //!
 //! Verbs: `list` (alias `ls`), `status`, `open` (Phase 0); `new`,
 //! `wait`, `archive`, `project add|list|remove`, `help --json`
-//! (Phase 1). The app is the daemon; this binary holds no state, reads
+//! (Phase 1); `watch` (v7: stream task state transitions). The app is the daemon; this binary holds no state, reads
 //! none of termic's data files, and links only `termic-proto`
 //! (docs/plans/cli.md). Exit codes and `--output-format` shapes are a
 //! public contract: see `termic_proto::exit_code` and the per-command
@@ -19,6 +19,7 @@ use termic_proto::exit_code;
 pub mod attach;
 pub mod client;
 pub mod output;
+pub mod plan_capture;
 
 /// The version `termic --version` prints. It is the APP version, injected
 /// at build time via `TERMIC_APP_VERSION` (src-tauri/build.rs and
@@ -298,6 +299,33 @@ running, 5 CLI disabled, 6 refused, 7 --timeout expired, 8 connection lost."
         /// Wait on one tab: a tab id, 1-based index, or title.
         #[arg(long, value_name = "SEL")]
         tab: Option<String>,
+    },
+
+    /// Stream task state changes as they happen (dashboards, automation).
+    #[command(
+        after_help = "Streams one event per task work-state transition across every task (or one \
+project's tasks under --project), starting with a snapshot of each task's \
+current state. States: working, waiting, done, idle, inactive (no agent tab \
+open); a task archived mid-watch emits one final \"archived\" event. Runs \
+until Ctrl-C, --timeout, or the app goes away.
+
+Built for external automation (ticket bridges, dashboards, notifiers): pair \
+with --output-format stream-json and consume NDJSON task_state events; \
+heartbeats ride along as the liveness signal during quiet stretches. Text \
+mode prints one \"project/task state\" line per event. This is the push \
+alternative to polling `termic list` in a loop.
+
+Exit codes: 0 the stream ended (--timeout reached, or the server closed it \
+cleanly), 1 error (unknown project, or the app's UI stopped reporting \
+state), 4 app not running, 5 CLI disabled, 6 refused, 8 connection lost."
+    )]
+    Watch {
+        /// Only this project's tasks.
+        #[arg(long)]
+        project: Option<String>,
+        /// End the stream (exit 0) after this long. E.g. 90, 30s, 5m, 1h.
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
     },
 
     /// Prompt the task's running agent; queues if it is mid-turn.
@@ -721,6 +749,15 @@ surface instead of parsing prose."
         /// Command to describe (default: the top-level overview).
         command: Option<String>,
     },
+
+    /// Internal: Claude Code plan-capture hook body. Reads a hook payload on
+    /// stdin and writes the plan into `$TERMIC_CONTEXT_DIR/plans/`.
+    ///
+    /// HIDDEN on purpose. The app wires this itself (src-tauri/src/plan_hook.rs)
+    /// and `help --json` is the agent-facing surface, so a verb no agent should
+    /// ever call stays out of it. Touches no socket and no app state.
+    #[command(hide = true, name = "capture-plan")]
+    CapturePlan,
 }
 
 #[derive(Subcommand, Debug)]
@@ -804,6 +841,18 @@ fn effective_format(cli: &Cli) -> OutputFormat {
 }
 
 fn execute(cli: &Cli) -> Result<Output, CliError> {
+    // Plan capture runs ABOVE the cage check on purpose. It is not part of
+    // the control-plane surface the cage withholds: no socket, no token, no
+    // app, just a file written inside the worktree the agent can already
+    // write to. And the caged case is precisely the one that needs it, since
+    // a sandboxed claude produces plans like any other. Silent by contract
+    // (a PreToolUse hook's stdout can carry permission decisions), so it
+    // returns empty output and never errors.
+    if let Cmd::CapturePlan = &cli.cmd {
+        plan_capture::run();
+        return Ok(Output::ok(String::new()));
+    }
+
     // In-cage pre-check (docs/plans/cli.md, Security DX): ENFORCING
     // cages get NO CLI surface; fail with the real reason instead of a
     // token error. Monitor is exempt by contract (observe, never
@@ -861,7 +910,7 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
     let token = client::read_token(&paths)?;
 
     match &cli.cmd {
-        Cmd::Help { .. } => unreachable!("handled above"),
+        Cmd::Help { .. } | Cmd::CapturePlan => unreachable!("handled above"),
         Cmd::New { .. } => execute_new(cli, &mut conn, &token, format, &paths, prompt),
         Cmd::Send { .. } => execute_send(cli, &mut conn, &token, format, prompt),
         Cmd::Attach { task, project, shell, tab, resize, detach_keys } => {
@@ -965,6 +1014,19 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
             };
             let code = w.result.outcome.exit_code();
             Ok(Output { stdout: final_stdout(format, &output::wait_text(&w), &w), code })
+        }
+        Cmd::Watch { project, timeout } => {
+            let timeout_ms = timeout.as_deref().map(parse_duration_ms).transpose()?;
+            let cmd = proto::Command::Watch { project: project.clone(), timeout_ms };
+            if format == OutputFormat::Text {
+                eprintln!("termic: watching task states (Ctrl-C stops; tasks keep running)");
+            }
+            let data = run_streamed(&mut conn, cmd, &token, format)?;
+            let proto::ReplyData::Watch(w) = data else {
+                return Err(CliError::new(exit_code::ERROR, "unexpected reply to watch"));
+            };
+            let text = format!("watch ended ({}) after {} events", w.reason, w.events);
+            Ok(Output::ok(final_stdout(format, &text, &w)))
         }
         Cmd::Agents => {
             let data = client::request(&mut conn, proto::Command::Agents, &token)?;
@@ -1580,6 +1642,12 @@ fn print_event(format: OutputFormat, ev: &proto::StreamEvent) {
             "queued" => {
                 eprintln!("termic: prompt queued; it sends when the agent's current turn finishes");
             }
+            "task_state" => {
+                // `watch`: one "project/task state" line per transition.
+                if let (Some(task), Some(state)) = (&ev.task, &ev.state) {
+                    println!("{}/{} {}", task.project, task.name, state);
+                }
+            }
             _ => {}
         },
     }
@@ -1790,6 +1858,12 @@ pub fn machine_help() -> serde_json::Value {
     let (_, global_flags) = args_of(&root);
     let mut commands = Vec::new();
     for sub in root.get_subcommands() {
+        // `get_subcommands` yields hidden verbs too. Internal ones (e.g.
+        // `capture-plan`) must stay out of the machine-readable surface:
+        // agents read this to learn what they may call.
+        if sub.is_hide_set() {
+            continue;
+        }
         if sub.get_name() == "help" {
             commands.push(command_entry(sub, "help"));
             continue;
@@ -2032,6 +2106,11 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing {expected} in {names:?}");
         }
+        // Hidden internal verbs stay OUT of the agent-facing surface.
+        assert!(
+            !names.contains(&"capture-plan"),
+            "capture-plan is internal and must not be advertised: {names:?}"
+        );
         // Every command documents exit codes; watched verbs carry theirs.
         let by_name = |n: &str| {
             v["commands"].as_array().unwrap().iter().find(|c| c["name"] == n).unwrap().clone()

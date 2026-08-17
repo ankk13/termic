@@ -30,6 +30,10 @@ export function GeneralSection() {
   // Whether the menu-bar item (Show/Quit Termic, the attention dropdown) is
   // shown at all. Also a backend field Rust re-reads live, on every save.
   const [trayEnabled, setTrayEnabled] = useState(true);
+  // Whether claude's plan-mode plan is mirrored into the task's
+  // .context/plans/. Backend field, read at spawn time, so a change applies
+  // to the next agent start rather than to running ones.
+  const [capturePlans, setCapturePlans] = useState(true);
   const [reposDir, setReposDir] = useState("");
   const [originalDir, setOriginalDir] = useState("");
   const [busy, setBusy] = useState(false);
@@ -43,6 +47,7 @@ export function GeneralSection() {
     if (!settings) return;
     setCloseAction(settings.close_action ?? "ask");
     setTrayEnabled(settings.tray_enabled ?? true);
+    setCapturePlans(settings.capture_plans ?? true);
   }, [settings]);
 
   async function saveCloseAction(v: "ask" | "menubar" | "quit") {
@@ -60,6 +65,15 @@ export function GeneralSection() {
     setTrayEnabled(v);
     if (!(await patch({ tray_enabled: v }))) {
       setTrayEnabled(prev);
+    }
+  }
+
+  async function saveCapturePlans(v: boolean) {
+    if (!settings) return;
+    const prev = capturePlans;
+    setCapturePlans(v);
+    if (!(await patch({ capture_plans: v }))) {
+      setCapturePlans(prev);
     }
   }
 
@@ -209,6 +223,15 @@ export function GeneralSection() {
           }
           value={trayEnabled}
           onChange={saveTrayEnabled}
+        />
+      </Block>
+
+      <Block id="setting-capture-plans">
+        <Toggle
+          label="Save agent plans to the task's .context folder"
+          hint="Claude writes plan-mode plans to a global folder outside your project, where Termic can't show them. With this on, the plan is copied into the task's .context/plans as it's presented, so you can read it in the file tree while you decide whether to approve it. Revisions update the same file. Applies to the next agent you start."
+          value={capturePlans}
+          onChange={saveCapturePlans}
         />
       </Block>
 

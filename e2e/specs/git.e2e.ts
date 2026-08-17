@@ -2,12 +2,14 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { archiveTask, clickByText, openTask, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitGone, waitVisible } from "../helpers";
+import { archiveTask, clickRightPanelTab, openTask, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitGone, waitVisible } from "../helpers";
+
+// Tasks here open the repo ROOT, so every case in this file edits this one
+// working tree and has to put it back.
+const fixture = process.env.E2E_FIXTURE ?? path.join(process.cwd(), ".e2e", "fixture-repo");
 
 // Git integration is central to termic (every task is a worktree/checkout).
 // This guards the Git panel: switching to it shows the working-tree status.
-// The seeded fixture-repo has a single commit and no edits, so the state is
-// deterministically clean.
 describe("git panel", () => {
   let taskId: string | undefined;
   after(async () => {
@@ -17,10 +19,18 @@ describe("git panel", () => {
   it("shows a clean working tree for the fixture repo", async () => {
     await waitForAppShell();
     await requireTermicApi();
+
+    // Establish the precondition rather than inherit it. The fixture repo
+    // lives in .e2e/ and PERSISTS between runs, so a run that died before its
+    // teardown (or a killed suite) leaves edits behind, and "clean tree" then
+    // fails forever after until someone resets it by hand.
+    execSync(`git -C "${fixture}" checkout -- .`);
+    execSync(`git -C "${fixture}" clean -fdq`);
+
     taskId = await openTask("e2e-git");
 
     // Switch the right panel from "All files" to "Git" (a real click).
-    await clickByText("Git");
+    await clickRightPanelTab("changes");
 
     // The Git status is fetched async; the clean-tree copy appears once it
     // resolves. waitForText auto-retries, so no sleep and no flake.
@@ -59,7 +69,7 @@ describe("git dirty tree", () => {
     );
 
     // Open the Git panel (starts clean).
-    await clickByText("Git");
+    await clickRightPanelTab("changes");
 
     // Dirty the tree, then force the panel's git poll to re-fetch.
     await browser.execute(async (id, c) => {
@@ -106,10 +116,6 @@ describe("git dirty tree", () => {
     );
   });
 });
-
-// Tasks here open the repo ROOT, so every case below edits this one working
-// tree and has to put it back.
-const fixture = process.env.E2E_FIXTURE ?? path.join(process.cwd(), ".e2e", "fixture-repo");
 
 // P1: a diff on a PNG renders pictures, not the screenful of U+FFFD that a
 // lossy decode of `git show HEAD:shot.png` used to produce. The fixture repo
